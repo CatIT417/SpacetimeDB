@@ -1,41 +1,12 @@
-use std::collections::{HashMap, HashSet};
-use sha3::{Digest, Sha3_256, digest::{generic_array::GenericArray, generic_array::typenum::U32}};
-
-type Hash = GenericArray<u8, U32>;
+use std::collections::HashSet;
+use crate::object_db::ObjectDB;
+use crate::hash::{Hash, hash_bytes};
 
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     ::std::slice::from_raw_parts(
         (p as *const T) as *const u8,
         ::std::mem::size_of::<T>(),
     )
-}
-
-fn hash_bytes(bytes: &[u8]) -> Hash {
-    let mut hasher = Sha3_256::new();
-    hasher.update(bytes);
-    hasher.finalize()
-}
-
-struct ObjectDB {
-    map: HashMap<Hash, Vec<u8>>
-}
-
-impl ObjectDB {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-
-    fn add(&mut self, bytes: Vec<u8>) -> Hash {
-        let hash = hash_bytes(&bytes);
-        self.map.insert(hash, bytes);
-        hash
-    }
-
-    fn get(&self, hash: Hash) -> Option<&[u8]> {
-        self.map.get(&hash).map(|v| &v[..])
-    }
 }
 
 #[repr(C, packed)]
@@ -406,6 +377,32 @@ mod tests {
         
         assert!(table.commit_tx(tx_2));
         assert!(table.commit_tx(tx_3));
+    }
+
+    #[test]
+    fn test_size() {
+        let start = std::time::Instant::now();
+        let mut table = Table::new();
+        for i in 0..1000 {
+            let mut tx_1 = table.begin_tx();
+            table.insert(&mut tx_1, MyRowObj {
+                my_name: hash_bytes(b"This is a byte string."),
+                my_i32: -i,
+                my_u64: i as u64,
+                my_hash: hash_bytes(b"This will be turned into a hash."),
+            });
+            table.insert(&mut tx_1, MyRowObj {
+                my_name: hash_bytes(b"This is a byte string."),
+                my_i32: -2 * i,
+                my_u64: i as u64,
+                my_hash: hash_bytes(b"This will be turned into a hash."),
+            });
+            assert!(table.commit_tx(tx_1));
+        }
+        let duration = start.elapsed();
+
+        println!("{}", table.odb.total_mem_size_bytes());
+        println!("{}", duration.as_millis());
     }
 
 }
