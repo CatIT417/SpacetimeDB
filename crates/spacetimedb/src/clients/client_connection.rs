@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::clients::client_connection_index::CLIENT_ACTOR_INDEX;
 use crate::hash::Hash;
-use crate::protobuf::websocket::{message, Message};
+use crate::protobuf::client_api::{message, Message};
 use crate::{api, wasm_host};
 use futures::{prelude::*, stream::SplitStream, SinkExt};
 use hyper::upgrade::Upgraded;
