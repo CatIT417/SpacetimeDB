@@ -1,38 +1,13 @@
-use crate::nodes::worker_node::control_node_connection::ControlNodeClient;
+use crate::nodes::worker_node::client_api::proxy::proxy_to_control_node_client_api;
 use gotham::{
-    handler::SimpleHandlerResult,
     prelude::*,
     router::{build_simple_router, Router},
-    state::State,
 };
-use hyper::{Body, Response, StatusCode};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IdentityResponse {
-    identity: String,
-    token: String,
-}
-
-async fn get_identity(_state: &mut State) -> SimpleHandlerResult {
-    let (identity, token) = ControlNodeClient::get_shared().get_new_identity().await.unwrap();
-
-    let identity_response = IdentityResponse {
-        identity: identity.to_hex(),
-        token,
-    };
-    let json = serde_json::to_string(&identity_response).unwrap();
-
-    let res = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(json))
-        .unwrap();
-
-    Ok(res)
-}
+use gotham::router::route::matcher::AnyRouteMatcher;
 
 pub fn router() -> Router {
     build_simple_router(|route| {
-        route.post("/").to_async_borrowing(get_identity);
+        route.request(AnyRouteMatcher::new(), "/").to_async(proxy_to_control_node_client_api);
+        route.request(AnyRouteMatcher::new(), "/*").to_async(proxy_to_control_node_client_api);
     })
 }
