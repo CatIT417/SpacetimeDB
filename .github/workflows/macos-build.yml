@@ -10,26 +10,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Install Rust
+      - name: Add aarch64 target
         run: |
           rustup target add aarch64-apple-darwin
 
-      - name: Show arch
-        run: uname -a
+      # - name: Compile x86
+      #   run: |
+      #     cargo build --release -p spacetimedb-cli
+      #     mkdir build
+      #     mv target/release/spacetime build/spacetime-darwin-x86
+      #
+      # - name: Compile Aarch64
+      #   run: |
+      #     cargo build --release -p spacetimedb-cli --target=aarch64-apple-darwin
+      #     mv target/aarch64-apple-darwin/release/spacetime build/spacetime-darwin-aarch64
+      #     find .
 
-      - name: Compile x86
+      - name: Just testing
         run: |
-          cargo build --release -p spacetimedb-cli
           mkdir build
-          mv target/release/spacetime build/spacetime-darwin-x86
+          touch build/macos
 
-      - name: Compile Aarch64
-        run: |
-          cargo build --release -p spacetimedb-cli --target=aarch64-apple-darwin
-          mv target/release/spacetime build/spacetime-darwin-aarch64
-
-      - name: Set env
-        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+      - name: Extract branch name
+        shell: bash
+        run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+        id: extract_branch
 
       - name: Upload to DO Spaces
         uses: shallwefootball/s3-upload-action@master
@@ -39,4 +44,4 @@ jobs:
           aws_bucket: ${{ vars.AWS_BUCKET }}
           source_dir: build
           endpoint: https://spacetimedb-client-binaries.nyc3.digitaloceanspaces.com
-          destination_dir: ${{ env.RELEASE_VERSION }}
+          destination_dir: ${{ steps.extract_branch.outputs.branch }}
