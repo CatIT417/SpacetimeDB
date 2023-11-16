@@ -45,6 +45,7 @@ use spacetimedb_sats::{
     db::auth::{StAccess, StTableType},
     AlgebraicType, AlgebraicValue, ProductType, ProductValue,
 };
+use wasmtime::Memory;
 use std::time::{Duration, Instant};
 use std::{
     borrow::Cow,
@@ -112,7 +113,10 @@ impl<'a> DataRef<'a> {
 }
 
 pub struct MutTxId {
-    lock: ArcMutexGuard<RawMutex, Inner>,
+    committed_state_lock: ArcMutexGuard<RawMutex, CommittedState>,
+    tx_state_lock: ArcMutexGuard<RawMutex, TxState>,
+    sequence_state_lock: ArcMutexGuard<RawMutex, SequencesState>,
+    memory_lock: ArcMutexGuard<RawMutex, Memory>,
     lock_wait_time: Duration,
     timer: Instant,
 }
@@ -124,6 +128,185 @@ struct CommittedState {
 impl CommittedState {
     fn new() -> Self {
         Self { tables: HashMap::new() }
+    }
+
+    fn bootstrap_system_table(&mut self, address: Address, schema: TableSchema) -> Result<(), DBError> {
+        // Reset the row count metric for this system table
+        DB_METRICS
+            .rdb_num_table_rows
+            .with_label_values(&address, &schema.table_id.into())
+            .set(0);
+
+        let table_id = schema.table_id;
+
+        // Insert the table row into st_tables, creating st_tables if it's missing
+        let st_tables = self
+            .get_or_create_table(ST_TABLES_ID, &ST_TABLE_ROW_TYPE, &st_table_schema());
+        let row = StTableRow {
+            table_id,
+            table_name: schema.table_name,
+            table_type: StTableType::System,
+            table_access: StAccess::Public,
+        };
+        let row: ProductValue = row.into();
+        let data_key = row.to_data_key();
+        st_tables.rows.insert(RowId(data_key), row);
+
+        // Increment row count for st_tables
+        DB_METRICS
+            .rdb_num_table_rows
+            .with_label_values(&address, &ST_TABLES_ID.into())
+            .inc();
+
+        // Insert the columns into st_columns
+        let first_col_id = schema.columns.first().unwrap().col_id;
+        for (i, col) in schema.columns.into_iter().enumerate() {
+            let col_name_for_autoinc = col.is_autoinc.then(|| col.col_name.clone());
+
+            let row = StColumnRow {
+                table_id,
+                col_id: i.into(),
+                col_name: col.col_name,
+                col_type: col.col_type,
+                is_autoinc: col.is_autoinc,
+            };
+            let row = ProductValue::from(row);
+            let data_key = row.to_data_key();
+            {
+                let st_columns =
+                    self
+                        .get_or_create_table(ST_COLUMNS_ID, &ST_COLUMNS_ROW_TYPE, &st_columns_schema());
+                st_columns.rows.insert(RowId(data_key), row);
+                // Increment row count for st_columns
+                DB_METRICS
+                    .rdb_num_table_rows
+                    .with_label_values(&address, &ST_COLUMNS_ID.into())
+                    .inc();
+            }
+
+            // If any columns are auto incrementing, we need to create a sequence
+            // NOTE: This code with the `seq_start` is particularly fragile.
+            // TODO: If we exceed  `SEQUENCE_PREALLOCATION_AMOUNT` we will get a unique violation
+            if let Some(col_name) = col_name_for_autoinc {
+                // The database is bootstrapped with the total of `SystemTables::total_` that identify what is the start of the sequence
+                let (seq_start, seq_id): (i128, SequenceId) = match schema.table_id {
+                    ST_TABLES_ID => (SystemTables::total_tables() as i128, TABLE_ID_SEQUENCE_ID),
+                    ST_INDEXES_ID => (
+                        (SystemTables::total_indexes() + SystemTables::total_constraints_indexes()) as i128,
+                        INDEX_ID_SEQUENCE_ID,
+                    ),
+                    ST_SEQUENCES_ID => (SystemTables::total_sequences() as i128, SEQUENCE_ID_SEQUENCE_ID),
+                    ST_CONSTRAINTS_ID => (SystemTables::total_constraints() as i128, CONSTRAINT_ID_SEQUENCE_ID),
+                    _ => unreachable!(),
+                };
+                let st_sequences = self.get_or_create_table(
+                    ST_SEQUENCES_ID,
+                    &ST_SEQUENCE_ROW_TYPE,
+                    &st_sequences_schema(),
+                );
+                let row = StSequenceRow {
+                    sequence_id: seq_id,
+                    sequence_name: format!("{}_seq", col_name),
+                    table_id: col.table_id,
+                    col_id: col.col_id,
+                    increment: 1,
+                    start: seq_start,
+                    min_value: 1,
+                    max_value: u32::MAX as i128,
+                    allocated: SEQUENCE_PREALLOCATION_AMOUNT,
+                };
+                let row = ProductValue::from(row);
+                let data_key = row.to_data_key();
+                st_sequences.rows.insert(RowId(data_key), row);
+                // Increment row count for st_sequences
+                DB_METRICS
+                    .rdb_num_table_rows
+                    .with_label_values(&address, &ST_SEQUENCES_ID.into())
+                    .inc();
+            }
+        }
+
+        //Insert constraints into `st_constraints`
+        let st_constraints = self.get_or_create_table(
+            ST_CONSTRAINTS_ID,
+            &ST_CONSTRAINT_ROW_TYPE,
+            &st_constraints_schema(),
+        );
+
+        let mut indexes = schema.indexes.clone();
+        //TODO: The constraints are limited to 1 column until indexes are changed to deal with n-columns
+        indexes.extend(schema.constraints.into_iter().map(|constraint| {
+            assert_eq!(constraint.columns.len(), 1, "Constraints only supported for 1 column.");
+
+            let index_name = format!("idx_{}", &constraint.constraint_name);
+
+            let row = StConstraintRow {
+                constraint_id: constraint.constraint_id,
+                constraint_name: constraint.constraint_name.clone(),
+                constraints: constraint.constraints,
+                table_id,
+                columns: constraint.columns,
+            };
+            let row = ProductValue::from(row);
+            let data_key = row.to_data_key();
+            st_constraints.rows.insert(RowId(data_key), row);
+
+            // Increment row count for st_constraints
+            DB_METRICS
+                .rdb_num_table_rows
+                .with_label_values(&address, &ST_CONSTRAINTS_ID.into())
+                .inc();
+
+            //TODO: This is a bug fixed in PR#267
+            let index_id = IndexId(constraint.constraint_id.0);
+
+            //Check if add an index:
+            match constraint.constraints {
+                x if x.has_unique() => IndexSchema {
+                    index_id,
+                    table_id,
+                    cols: NonEmpty::new(first_col_id),
+                    index_name,
+                    is_unique: true,
+                    index_type: IndexType::BTree,
+                },
+                x if x.has_indexed() => IndexSchema {
+                    index_id,
+                    table_id,
+                    cols: NonEmpty::new(first_col_id),
+                    index_name,
+                    is_unique: false,
+                    index_type: IndexType::BTree,
+                },
+                x => panic!("Adding constraint of kind `{x:?}` is not supported yet."),
+            }
+        }));
+
+        // Insert the indexes into st_indexes
+        let st_indexes =
+            self
+                .get_or_create_table(ST_INDEXES_ID, &ST_INDEX_ROW_TYPE, &st_indexes_schema());
+        for (_, index) in indexes.into_iter().enumerate() {
+            let row = StIndexRow {
+                index_id: index.index_id,
+                table_id,
+                cols: index.cols,
+                index_name: index.index_name,
+                is_unique: index.is_unique,
+                index_type: IndexType::BTree,
+            };
+            let row = ProductValue::from(row);
+            let data_key = row.to_data_key();
+            st_indexes.rows.insert(RowId(data_key), row);
+
+            // Increment row count for st_indexes
+            DB_METRICS
+                .rdb_num_table_rows
+                .with_label_values(&address, &ST_INDEXES_ID.into())
+                .inc();
+        }
+
+        Ok(())
     }
 
     fn get_or_create_table(&mut self, table_id: TableId, row_type: &ProductType, schema: &TableSchema) -> &mut Table {
@@ -334,13 +517,13 @@ impl SequencesState {
 
 struct Inner {
     /// All of the byte objects inserted in the current transaction.
-    memory: BTreeMap<DataKey, Arc<Vec<u8>>>,
+    memory: Arc<Mutex<BTreeMap<DataKey, Arc<Vec<u8>>>>>,
     /// The state of the database up to the point of the last committed transaction.
-    committed_state: CommittedState,
+    committed_state: Arc<Mutex<CommittedState>>,
     /// The state of all insertions and deletions in this transaction.
-    tx_state: Option<TxState>,
+    tx_state: Arc<Mutex<Option<TxState>>>,
     /// The state of sequence generation in this database.
-    sequence_state: SequencesState,
+    sequence_state: Arc<Mutex<SequencesState>>,
     /// The address of this database.
     database_address: Address,
 }
@@ -348,192 +531,12 @@ struct Inner {
 impl Inner {
     pub fn new(database_address: Address) -> Self {
         Self {
-            memory: BTreeMap::new(),
-            committed_state: CommittedState::new(),
-            tx_state: None,
-            sequence_state: SequencesState::new(),
+            memory: Arc::new(Mutex::new(BTreeMap::new())),
+            committed_state: Arc::new(Mutex::new(CommittedState::new())),
+            tx_state: Arc::new(Mutex::new(None)),
+            sequence_state: Arc::new(Mutex::new(SequencesState::new())),
             database_address,
         }
-    }
-
-    fn bootstrap_system_table(&mut self, schema: TableSchema) -> Result<(), DBError> {
-        // Reset the row count metric for this system table
-        DB_METRICS
-            .rdb_num_table_rows
-            .with_label_values(&self.database_address, &schema.table_id.into())
-            .set(0);
-
-        let table_id = schema.table_id;
-
-        // Insert the table row into st_tables, creating st_tables if it's missing
-        let st_tables = self
-            .committed_state
-            .get_or_create_table(ST_TABLES_ID, &ST_TABLE_ROW_TYPE, &st_table_schema());
-        let row = StTableRow {
-            table_id,
-            table_name: schema.table_name,
-            table_type: StTableType::System,
-            table_access: StAccess::Public,
-        };
-        let row: ProductValue = row.into();
-        let data_key = row.to_data_key();
-        st_tables.rows.insert(RowId(data_key), row);
-
-        // Increment row count for st_tables
-        DB_METRICS
-            .rdb_num_table_rows
-            .with_label_values(&self.database_address, &ST_TABLES_ID.into())
-            .inc();
-
-        // Insert the columns into st_columns
-        let first_col_id = schema.columns.first().unwrap().col_id;
-        for (i, col) in schema.columns.into_iter().enumerate() {
-            let col_name_for_autoinc = col.is_autoinc.then(|| col.col_name.clone());
-
-            let row = StColumnRow {
-                table_id,
-                col_id: i.into(),
-                col_name: col.col_name,
-                col_type: col.col_type,
-                is_autoinc: col.is_autoinc,
-            };
-            let row = ProductValue::from(row);
-            let data_key = row.to_data_key();
-            {
-                let st_columns =
-                    self.committed_state
-                        .get_or_create_table(ST_COLUMNS_ID, &ST_COLUMNS_ROW_TYPE, &st_columns_schema());
-                st_columns.rows.insert(RowId(data_key), row);
-                // Increment row count for st_columns
-                DB_METRICS
-                    .rdb_num_table_rows
-                    .with_label_values(&self.database_address, &ST_COLUMNS_ID.into())
-                    .inc();
-            }
-
-            // If any columns are auto incrementing, we need to create a sequence
-            // NOTE: This code with the `seq_start` is particularly fragile.
-            // TODO: If we exceed  `SEQUENCE_PREALLOCATION_AMOUNT` we will get a unique violation
-            if let Some(col_name) = col_name_for_autoinc {
-                // The database is bootstrapped with the total of `SystemTables::total_` that identify what is the start of the sequence
-                let (seq_start, seq_id): (i128, SequenceId) = match schema.table_id {
-                    ST_TABLES_ID => (SystemTables::total_tables() as i128, TABLE_ID_SEQUENCE_ID),
-                    ST_INDEXES_ID => (
-                        (SystemTables::total_indexes() + SystemTables::total_constraints_indexes()) as i128,
-                        INDEX_ID_SEQUENCE_ID,
-                    ),
-                    ST_SEQUENCES_ID => (SystemTables::total_sequences() as i128, SEQUENCE_ID_SEQUENCE_ID),
-                    ST_CONSTRAINTS_ID => (SystemTables::total_constraints() as i128, CONSTRAINT_ID_SEQUENCE_ID),
-                    _ => unreachable!(),
-                };
-                let st_sequences = self.committed_state.get_or_create_table(
-                    ST_SEQUENCES_ID,
-                    &ST_SEQUENCE_ROW_TYPE,
-                    &st_sequences_schema(),
-                );
-                let row = StSequenceRow {
-                    sequence_id: seq_id,
-                    sequence_name: format!("{}_seq", col_name),
-                    table_id: col.table_id,
-                    col_id: col.col_id,
-                    increment: 1,
-                    start: seq_start,
-                    min_value: 1,
-                    max_value: u32::MAX as i128,
-                    allocated: SEQUENCE_PREALLOCATION_AMOUNT,
-                };
-                let row = ProductValue::from(row);
-                let data_key = row.to_data_key();
-                st_sequences.rows.insert(RowId(data_key), row);
-                // Increment row count for st_sequences
-                DB_METRICS
-                    .rdb_num_table_rows
-                    .with_label_values(&self.database_address, &ST_SEQUENCES_ID.into())
-                    .inc();
-            }
-        }
-
-        //Insert constraints into `st_constraints`
-        let st_constraints = self.committed_state.get_or_create_table(
-            ST_CONSTRAINTS_ID,
-            &ST_CONSTRAINT_ROW_TYPE,
-            &st_constraints_schema(),
-        );
-
-        let mut indexes = schema.indexes.clone();
-        //TODO: The constraints are limited to 1 column until indexes are changed to deal with n-columns
-        indexes.extend(schema.constraints.into_iter().map(|constraint| {
-            assert_eq!(constraint.columns.len(), 1, "Constraints only supported for 1 column.");
-
-            let index_name = format!("idx_{}", &constraint.constraint_name);
-
-            let row = StConstraintRow {
-                constraint_id: constraint.constraint_id,
-                constraint_name: constraint.constraint_name.clone(),
-                constraints: constraint.constraints,
-                table_id,
-                columns: constraint.columns,
-            };
-            let row = ProductValue::from(row);
-            let data_key = row.to_data_key();
-            st_constraints.rows.insert(RowId(data_key), row);
-
-            // Increment row count for st_constraints
-            DB_METRICS
-                .rdb_num_table_rows
-                .with_label_values(&self.database_address, &ST_CONSTRAINTS_ID.into())
-                .inc();
-
-            //TODO: This is a bug fixed in PR#267
-            let index_id = IndexId(constraint.constraint_id.0);
-
-            //Check if add an index:
-            match constraint.constraints {
-                x if x.has_unique() => IndexSchema {
-                    index_id,
-                    table_id,
-                    cols: NonEmpty::new(first_col_id),
-                    index_name,
-                    is_unique: true,
-                    index_type: IndexType::BTree,
-                },
-                x if x.has_indexed() => IndexSchema {
-                    index_id,
-                    table_id,
-                    cols: NonEmpty::new(first_col_id),
-                    index_name,
-                    is_unique: false,
-                    index_type: IndexType::BTree,
-                },
-                x => panic!("Adding constraint of kind `{x:?}` is not supported yet."),
-            }
-        }));
-
-        // Insert the indexes into st_indexes
-        let st_indexes =
-            self.committed_state
-                .get_or_create_table(ST_INDEXES_ID, &ST_INDEX_ROW_TYPE, &st_indexes_schema());
-        for (_, index) in indexes.into_iter().enumerate() {
-            let row = StIndexRow {
-                index_id: index.index_id,
-                table_id,
-                cols: index.cols,
-                index_name: index.index_name,
-                is_unique: index.is_unique,
-                index_type: IndexType::BTree,
-            };
-            let row = ProductValue::from(row);
-            let data_key = row.to_data_key();
-            st_indexes.rows.insert(RowId(data_key), row);
-
-            // Increment row count for st_indexes
-            DB_METRICS
-                .rdb_num_table_rows
-                .with_label_values(&self.database_address, &ST_INDEXES_ID.into())
-                .inc();
-        }
-
-        Ok(())
     }
 
     fn build_sequence_state(&mut self) -> super::Result<()> {
@@ -1548,7 +1551,7 @@ impl Inner {
 
 #[derive(Clone)]
 pub struct Locking {
-    inner: Arc<Mutex<Inner>>,
+    inner: Inner,
 }
 
 impl Locking {
@@ -2075,14 +2078,22 @@ impl traits::MutTx for Locking {
 
     fn begin_mut_tx(&self) -> Self::MutTxId {
         let timer = Instant::now();
-        let mut inner = self.inner.lock_arc();
+
+        let mut committed_state_lock = self.inner.committed_state.lock_arc();
+        let mut tx_state_lock = self.inner.tx_state.lock_arc();
+        let mut sequence_state_lock = self.inner.sequence_state.lock_arc();
+        let mut memory_lock = self.inner.memory.lock_arc();
+
         let lock_wait_time = timer.elapsed();
-        if inner.tx_state.is_some() {
+        if tx_state_lock.is_some() {
             panic!("The previous transaction was not properly rolled back or committed.");
         }
-        inner.tx_state = Some(TxState::new());
+        tx_state_lock = Some(TxState::new());
         MutTxId {
-            lock: inner,
+            committed_state_lock,
+            tx_state_lock,
+            sequence_state_lock,
+            memory_lock,
             lock_wait_time,
             timer,
         }
