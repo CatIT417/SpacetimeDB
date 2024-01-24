@@ -139,9 +139,9 @@ impl ModuleSubscriptionActor {
             queries.extend(qset);
         }
 
-        let sub = match self.subscriptions.iter_mut().find(|s| s.read_arc().queries == queries) {
+        let sub = match self.subscriptions.iter_mut().find(|s| s.read().queries == queries) {
             Some(sub) => {
-                sub.write_arc().add_subscriber(sender);
+                sub.write().add_subscriber(sender);
                 sub
             }
             None => {
@@ -184,7 +184,7 @@ impl ModuleSubscriptionActor {
 
     fn remove_subscriber(&mut self, client_id: ClientActorId) {
         self.subscriptions.retain_mut(|sub| {
-            let mut subscription = sub.write_arc();
+            let mut subscription = sub.write();
             subscription.remove_subscriber(client_id);
             !subscription.subscribers().is_empty()
         })
