@@ -1581,12 +1581,25 @@ mod tests {
         datastore.rollback_mut_tx(&ctx, tx);
 
         let tx = datastore.begin_mut_tx();
-        assert_eq!(
+        assert!(
             datastore.table_id_exists_mut_tx(&tx, &table_id),
-            true,
             "Table should still exist"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_table_is_transactional() -> ResultTest<()> {
+        let (datastore, tx, table_id) = setup_table()?;
+        let ctx = ExecutionContext::default();
+        datastore.rollback_mut_tx(&ctx, tx);
+
+        let tx = datastore.begin_mut_tx();
+        assert!(
+            !datastore.table_id_exists_mut_tx(&tx, &table_id),
+            "Table should not exist"
+        );
         Ok(())
     }
 
