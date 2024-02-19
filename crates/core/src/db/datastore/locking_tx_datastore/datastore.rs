@@ -1581,7 +1581,11 @@ mod tests {
         datastore.rollback_mut_tx(&ctx, tx);
 
         let tx = datastore.begin_mut_tx();
-        assert_eq!(datastore.table_id_exists_mut_tx(&tx, &table_id), true, "Table should still exist");
+        assert_eq!(
+            datastore.table_id_exists_mut_tx(&tx, &table_id),
+            true,
+            "Table should still exist"
+        );
 
         Ok(())
     }
