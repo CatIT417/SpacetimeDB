@@ -23,6 +23,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use itertools::Itertools;
+use spacetimedb_metrics::typed_prometheus::AsPrometheusLabel;
 use spacetimedb_primitives::{ColList, TableId};
 use spacetimedb_sats::{
     bsatn,
@@ -566,6 +567,21 @@ impl<'a> CommittedIndexIter<'a> {
     }
 }
 
+struct FAKE_METRICS {
+
+}
+impl FAKE_METRICS {
+    pub fn new () {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        
+    }
+    pub fn with_label_values(&self, workload: &str, db: &str, reducer_name: &str, table_id: &u32, table_name: &str) -> Self {
+        let workload = workload.as_prometheus_str();
+    }
+    pub fn inc_by(&self, i: u64) {
+    }
+}
+
 #[cfg(feature = "metrics")]
 impl Drop for CommittedIndexIter<'_> {
     fn drop(&mut self) {
@@ -578,20 +594,19 @@ impl Drop for CommittedIndexIter<'_> {
             .get_schema(&self.table_id)
             .map(|table| table.table_name.as_str())
             .unwrap_or_default();
-
-        DB_METRICS
-            .rdb_num_index_seeks
+        
+        //DB_METRICS
+        FAKE_METRICS
             .with_label_values(workload, db, reducer_name, table_id, table_name)
-            .inc();
+            .inc_by(1);
 
         // Increment number of index keys scanned
-        DB_METRICS
-            .rdb_num_keys_scanned
+        FAKE_METRICS
             .with_label_values(workload, db, reducer_name, table_id, table_name)
             .inc_by(self.committed_rows.num_pointers_yielded());
 
         // Increment number of rows fetched
-        DB_METRICS
+        FAKE_METRICS
             .rdb_num_rows_fetched
             .with_label_values(workload, db, reducer_name, table_id, table_name)
             .inc_by(self.num_committed_rows_fetched);
