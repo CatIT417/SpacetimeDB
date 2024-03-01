@@ -5,7 +5,7 @@ use crate::host::AbiCall;
 use once_cell::sync::Lazy;
 use prometheus::{GaugeVec, HistogramVec, IntCounterVec, IntGaugeVec};
 use spacetimedb_lib::Address;
-use spacetimedb_metrics::metrics_group;
+use spacetimedb_metrics::{metrics_group, typed_prometheus::AsPrometheusLabel};
 
 metrics_group!(
     #[non_exhaustive]
@@ -132,6 +132,43 @@ metrics_group!(
     }
 );
 
+
+#[derive(Debug)]
+pub struct Counter {
+    labels: [arrayvec::ArrayString<32>; 5],
+}
+
+impl Counter {
+    pub fn inc_by(&self, i: u64) {
+        
+    }
+}
+
+pub struct FakeMetrics {
+    pub tx: tokio::sync::mpsc::UnboundedSender<Counter>,
+}
+impl FakeMetrics {
+    pub fn new () -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Counter>();
+        tokio::spawn(async move {
+            while let Some(counter) = rx.recv().await {
+                counter.inc_by(1);
+            }
+        });
+        Self{tx}
+    }
+    pub fn with_label_values(&self, workload: &WorkloadType, db: &Address, reducer_name: &str, table_id: &u32, table_name: &str) -> Counter {
+        let workload = workload.as_prometheus_str();
+        let db = db.as_prometheus_str();
+        let reducer_name = reducer_name.as_prometheus_str();
+        let table_id = table_id.as_prometheus_str();
+        let table_name = table_name.as_prometheus_str();
+        Counter{
+            labels:[workload, db, reducer_name, table_id, table_name]
+        }
+    }
+}
+
 type ReducerLabel = (Address, WorkloadType, String);
 type AddressLabel = (Address, WorkloadType);
 
@@ -139,6 +176,7 @@ pub static MAX_TX_CPU_TIME: Lazy<Mutex<HashMap<ReducerLabel, f64>>> = Lazy::new(
 pub static MAX_QUERY_CPU_TIME: Lazy<Mutex<HashMap<AddressLabel, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 pub static MAX_QUERY_COMPILE_TIME: Lazy<Mutex<HashMap<AddressLabel, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 pub static DB_METRICS: Lazy<DbMetrics> = Lazy::new(DbMetrics::new);
+pub static FAKE_METRIC: Lazy<FakeMetrics> = Lazy::new(FakeMetrics::new);
 
 pub fn reset_counters() {
     // Reset max reducer durations

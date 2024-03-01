@@ -16,20 +16,20 @@ use crate::{
             },
             traits::{TxData, TxOp, TxRecord},
         },
-        db_metrics::DB_METRICS,
+        db_metrics::{DB_METRICS, FAKE_METRIC},
     },
     error::TableError,
-    execution_context::ExecutionContext,
+    execution_context::{ExecutionContext, WorkloadType},
 };
 use anyhow::anyhow;
 use itertools::Itertools;
+use openssl::derive;
 use spacetimedb_metrics::typed_prometheus::AsPrometheusLabel;
 use spacetimedb_primitives::{ColList, TableId};
 use spacetimedb_sats::{
     bsatn,
     db::{
-        auth::{StAccess, StTableType},
-        def::TableSchema,
+        self, auth::{StAccess, StTableType}, def::TableSchema
     },
     AlgebraicValue, DataKey, ProductValue, ToDataKey,
 };
@@ -567,20 +567,6 @@ impl<'a> CommittedIndexIter<'a> {
     }
 }
 
-struct FAKE_METRICS {
-
-}
-impl FAKE_METRICS {
-    pub fn new () {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        
-    }
-    pub fn with_label_values(&self, workload: &str, db: &str, reducer_name: &str, table_id: &u32, table_name: &str) -> Self {
-        let workload = workload.as_prometheus_str();
-    }
-    pub fn inc_by(&self, i: u64) {
-    }
-}
 
 #[cfg(feature = "metrics")]
 impl Drop for CommittedIndexIter<'_> {
@@ -596,20 +582,20 @@ impl Drop for CommittedIndexIter<'_> {
             .unwrap_or_default();
         
         //DB_METRICS
-        FAKE_METRICS
-            .with_label_values(workload, db, reducer_name, table_id, table_name)
-            .inc_by(1);
+        let cout = FAKE_METRIC
+            .with_label_values(workload, db, reducer_name, table_id, table_name);
+        let _ = FAKE_METRIC.tx.send(cout);
 
         // Increment number of index keys scanned
-        FAKE_METRICS
-            .with_label_values(workload, db, reducer_name, table_id, table_name)
-            .inc_by(self.committed_rows.num_pointers_yielded());
+        let cout = FAKE_METRIC
+            .with_label_values(workload, db, reducer_name, table_id, table_name);
+        FAKE_METRIC.tx.send(cout);
 
         // Increment number of rows fetched
-        FAKE_METRICS
-            .rdb_num_rows_fetched
-            .with_label_values(workload, db, reducer_name, table_id, table_name)
-            .inc_by(self.num_committed_rows_fetched);
+        let cout = FAKE_METRIC
+            .with_label_values(workload, db, reducer_name, table_id, table_name);
+        FAKE_METRIC.tx.send(cout);
+
     }
 }
 

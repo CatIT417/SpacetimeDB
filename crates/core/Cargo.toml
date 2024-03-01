@@ -95,6 +95,7 @@ uuid.workspace = true
 wasmtime.workspace = true
 # Rocksdb ostorage backend, linked only if "rocksdb" feature enabled.
 rocksdb = {workspace = true, optional = true}
+arrayvec.workspace = true
 
 [features]
 # Enable metrics in spacetimedb.
