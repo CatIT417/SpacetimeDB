@@ -130,7 +130,8 @@ impl SubscriptionManager {
                 }
             }
 
-            units
+            let span = tracing::info_span!("eval_incr").entered();
+            let updates = units
                 .into_par_iter()
                 .filter_map(|(hash, tables)| self.queries.get(hash).map(|unit| (hash, tables, unit)))
                 .filter_map(|(hash, tables, unit)| {
@@ -156,7 +157,11 @@ impl SubscriptionManager {
                         .flatten()
                         .map(move |id| (id, delta.table_id, delta.clone()))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            drop(span);
+
+            let span = tracing::info_span!("eval_reduce").entered();
+            let updates = updates
                 .into_iter()
                 .fold(
                     HashMap::new(),
@@ -180,22 +185,24 @@ impl SubscriptionManager {
                         updates.insert(id, vec![delta].into());
                     }
                     updates
-                })
-                .into_iter()
-                .for_each(|(id, database_update)| {
-                    let client = self.client(id);
-                    let message = TransactionUpdateMessage {
-                        event,
-                        database_update: SubscriptionUpdate {
-                            database_update,
-                            request_id: event.request_id,
-                            timer: event.timer,
-                        },
-                    };
-                    if let Err(e) = client.send_message(message) {
-                        tracing::warn!(%client.id, "failed to send update message to client: {e}")
-                    }
                 });
+            drop(span);
+
+            let _span = tracing::info_span!("eval_send").entered();
+            updates.into_iter().for_each(|(id, database_update)| {
+                let client = self.client(id);
+                let message = TransactionUpdateMessage {
+                    event,
+                    database_update: SubscriptionUpdate {
+                        database_update,
+                        request_id: event.request_id,
+                        timer: event.timer,
+                    },
+                };
+                if let Err(e) = client.send_message(message) {
+                    tracing::warn!(%client.id, "failed to send update message to client: {e}")
+                }
+            });
         })
     }
 }
