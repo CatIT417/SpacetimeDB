@@ -2,6 +2,7 @@ use std::io;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::sync::{MutexGuard, PoisonError};
+use std::time::Duration;
 
 use hex::FromHexError;
 use spacetimedb_sats::AlgebraicType;
@@ -96,6 +97,8 @@ pub enum SubscriptionError {
     SideEffect(Crud),
     #[error("Unsupported query on subscription: {0:?}")]
     Unsupported(String),
+    #[error("Query evaluation exceeded timeout: {0:?}")]
+    Timeout(Duration),
 }
 
 #[derive(Error, Debug)]

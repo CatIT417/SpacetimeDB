@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 use spacetimedb_lib::identity::AuthCtx;
 use spacetimedb_lib::Identity;
 use std::{sync::Arc, time::Instant};
+use tokio::sync::oneshot;
 
 type Subscriptions = Arc<RwLock<SubscriptionManager>>;
 
@@ -42,6 +43,7 @@ impl ModuleSubscriptions {
         sender: Arc<ClientConnectionSender>,
         subscription: Subscribe,
         timer: Instant,
+        timeout: oneshot::Sender<()>,
         _assert: Option<AssertTxFn>,
     ) -> Result<(), DBError> {
         let ctx = ExecutionContext::subscribe(
@@ -49,6 +51,7 @@ impl ModuleSubscriptions {
             self.relational_db.read_config().slow_query,
         );
         let tx = scopeguard::guard(self.relational_db.begin_tx(), |tx| {
+            let _ = timeout.send(());
             self.relational_db.release_tx(&ctx, tx);
         });
         // check for backward comp.
@@ -188,6 +191,7 @@ mod tests {
     use std::time::Instant;
     use std::{sync::Arc, time::Duration};
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
     #[test]
     /// Asserts that a subscription holds a tx handle for the entire length of its evaluation.
@@ -210,6 +214,8 @@ mod tests {
 
         let (send, mut recv) = mpsc::unbounded_channel();
 
+        let (timeout, _) = oneshot::channel();
+
         // Subscribing to T should return a single row
         let query_handle = runtime.spawn_blocking(move || {
             let db = module_subscriptions.relational_db.clone();
@@ -221,6 +227,7 @@ mod tests {
                     request_id: 0,
                 },
                 Instant::now(),
+                timeout,
                 Some(Arc::new(move |tx: &_| {
                     // Wake up writer thread after starting the reader tx
                     let _ = send.send(());

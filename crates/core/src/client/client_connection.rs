@@ -1,11 +1,11 @@
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::messages::{OneOffQueryResponseMessage, SerializableMessage};
 use super::{message_handlers, ClientActorId, MessageHandleError};
-use crate::error::DBError;
+use crate::error::{DBError, SubscriptionError};
 use crate::host::{ModuleHost, ReducerArgs, ReducerCallError, ReducerCallResult};
 use crate::protobuf::client_api::Subscribe;
 use crate::util::prometheus_handle::IntGaugeExt;
@@ -217,13 +217,17 @@ impl ClientConnection {
 
     pub async fn subscribe(&self, subscription: Subscribe, timer: Instant) -> Result<(), DBError> {
         let me = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let (send, recv) = oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
             me.module
                 .subscriptions()
-                .add_subscriber(me.sender, subscription, timer, None)
-        })
-        .await
-        .unwrap()
+                .add_subscriber(me.sender, subscription, timer, send, None)
+        });
+        let timeout = Duration::from_secs(5);
+        if (tokio::time::timeout(timeout, recv).await).is_err() {
+            return Err(SubscriptionError::Timeout(timeout).into());
+        }
+        task.await.unwrap()
     }
 
     pub async fn one_off_query(&self, query: &str, message_id: &[u8], timer: Instant) -> Result<(), anyhow::Error> {
