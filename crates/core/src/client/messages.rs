@@ -7,6 +7,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::execution_context::WorkloadType;
 use crate::host::module_host::{DatabaseUpdate, EventStatus, ModuleEvent, ProtocolDatabaseUpdate};
 use crate::identity::Identity;
 use crate::json::client_api::{
@@ -75,6 +76,29 @@ pub enum SerializableMessage {
     Subscribe(SubscriptionUpdateMessage),
     DatabaseUpdate(TransactionUpdateMessage<DatabaseUpdate>),
     ProtocolUpdate(TransactionUpdateMessage<ProtocolDatabaseUpdate>),
+}
+
+impl SerializableMessage {
+    /// The number of rows in the payload
+    pub fn num_rows(&self) -> Option<usize> {
+        match self {
+            Self::Query(msg) => Some(msg.num_rows()),
+            Self::Subscribe(msg) => Some(msg.num_rows()),
+            Self::DatabaseUpdate(msg) => Some(msg.database_update.database_update.num_rows()),
+            Self::ProtocolUpdate(msg) => Some(msg.database_update.database_update.num_rows()),
+            _ => None,
+        }
+    }
+
+    /// The type of workload from which this payload originates
+    pub fn workload(&self) -> Option<WorkloadType> {
+        match self {
+            Self::Query(_) => Some(WorkloadType::Sql),
+            Self::Subscribe(_) => Some(WorkloadType::Subscribe),
+            Self::DatabaseUpdate(_) | Self::ProtocolUpdate(_) => Some(WorkloadType::Update),
+            _ => None,
+        }
+    }
 }
 
 impl ServerMessage for SerializableMessage {
@@ -202,6 +226,13 @@ pub struct SubscriptionUpdateMessage {
     pub subscription_update: SubscriptionUpdate<ProtocolDatabaseUpdate>,
 }
 
+impl SubscriptionUpdateMessage {
+    /// The number of rows in the payload
+    pub fn num_rows(&self) -> usize {
+        self.subscription_update.database_update.num_rows()
+    }
+}
+
 impl ServerMessage for SubscriptionUpdateMessage {
     fn serialize_text(self) -> MessageJson {
         MessageJson::SubscriptionUpdate(self.subscription_update.into_json())
@@ -247,6 +278,13 @@ pub struct OneOffQueryResponseMessage {
     pub error: Option<String>,
     pub results: Vec<MemTable>,
     pub total_host_execution_duration: u64,
+}
+
+impl OneOffQueryResponseMessage {
+    /// The number of rows in the payload.
+    pub fn num_rows(&self) -> usize {
+        self.results.iter().map(|t| t.data.len()).sum()
+    }
 }
 
 impl ServerMessage for OneOffQueryResponseMessage {

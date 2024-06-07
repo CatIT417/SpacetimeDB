@@ -2,7 +2,7 @@ use crate::execution_context::WorkloadType;
 use once_cell::sync::Lazy;
 use prometheus::{GaugeVec, HistogramVec, IntCounterVec, IntGaugeVec};
 use spacetimedb_data_structures::map::HashMap;
-use spacetimedb_lib::Address;
+use spacetimedb_lib::{Address, Identity};
 use spacetimedb_metrics::metrics_group;
 use spacetimedb_primitives::TableId;
 use std::sync::Mutex;
@@ -80,6 +80,16 @@ metrics_group!(
         #[help = "The number of bytes in a table with the precision of a page size"]
         #[labels(db: Address, table_id: u32, table_name: str)]
         pub rdb_table_size: IntGaugeVec,
+
+        #[name = spacetime_query_bytes_returned]
+        #[help = "The size of query messages sent to connected sessions"]
+        #[labels(db: Address, client: Identity, workload: WorkloadType)]
+        pub query_bytes_returned: HistogramVec,
+
+        #[name = spacetime_query_rows_returned]
+        #[help = "The number of rows sent to connected sessions"]
+        #[labels(database_address: Address, caller: Identity, workload: WorkloadType)]
+        pub query_rows_returned: HistogramVec,
     }
 );
 

@@ -13,9 +13,9 @@ use scopeguard::ScopeGuard;
 use serde::Deserialize;
 use spacetimedb::client::messages::{IdentityTokenMessage, SerializableMessage, ServerMessage};
 use spacetimedb::client::{ClientActorId, ClientConnection, DataMessage, MessageHandleError, Protocol};
+use spacetimedb::db::db_metrics::DB_METRICS;
 use spacetimedb::host::NoSuchModule;
 use spacetimedb::util::also_poll;
-use spacetimedb::worker_metrics::WORKER_METRICS;
 use spacetimedb_lib::address::AddressForUrl;
 use spacetimedb_lib::Address;
 use std::time::Instant;
@@ -132,7 +132,8 @@ where
         }
 
         let actor = |client, sendrx| ws_client_actor(client, ws, sendrx);
-        let client = match ClientConnection::spawn(client_id, protocol, instance_id, module_rx, actor).await {
+        let client = match ClientConnection::spawn(client_id, protocol, db_address, instance_id, module_rx, actor).await
+        {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("ModuleHost died while we were connecting: {e:#}");
@@ -257,12 +258,26 @@ async fn ws_client_actor_inner(
                     log::info!("dropping messages due to ws already being closed: {:?}", &rx_buf[..n]);
                 } else {
                     let send_all = async {
+                        let db = client.database_address;
                         let id = client.id.identity;
-                        for msg in rx_buf.drain(..n).map(|msg| datamsg_to_wsmsg(msg.serialize(client.protocol))) {
-                            WORKER_METRICS.websocket_sent.with_label_values(&id).inc();
-                            WORKER_METRICS.websocket_sent_msg_size.with_label_values(&id).observe(msg.len() as f64);
+                        for msg in rx_buf.drain(..n) {
+                            let workload = msg.workload();
+                            let rows_in_payload = msg.num_rows();
+                            let payload = datamsg_to_wsmsg(msg.serialize(client.protocol));
+                            if let Some(workload) = workload {
+                                if let Some(rows_in_payload) = rows_in_payload {
+                                    DB_METRICS
+                                        .query_rows_returned
+                                        .with_label_values(&db, &id, &workload)
+                                        .observe(rows_in_payload as f64);
+                                    DB_METRICS
+                                        .query_bytes_returned
+                                        .with_label_values(&db, &id, &workload)
+                                        .observe(payload.len() as f64);
+                                }
+                            }
                             // feed() buffers the message, but does not necessarily send it
-                            ws.feed(msg).await?;
+                            ws.feed(payload).await?;
                         }
                         // now we flush all the messages to the socket
                         ws.flush().await

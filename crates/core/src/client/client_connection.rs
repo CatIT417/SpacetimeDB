@@ -13,6 +13,7 @@ use crate::worker_metrics::WORKER_METRICS;
 use derive_more::From;
 use futures::prelude::*;
 use spacetimedb_lib::identity::RequestId;
+use spacetimedb_lib::Address;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
@@ -91,6 +92,7 @@ impl ClientConnectionSender {
 #[non_exhaustive]
 pub struct ClientConnection {
     sender: Arc<ClientConnectionSender>,
+    pub database_address: Address,
     pub database_instance_id: u64,
     pub module: ModuleHost,
     module_rx: watch::Receiver<ModuleHost>,
@@ -133,6 +135,7 @@ impl ClientConnection {
     pub async fn spawn<F, Fut>(
         id: ClientActorId,
         protocol: Protocol,
+        database_address: Address,
         database_instance_id: u64,
         mut module_rx: watch::Receiver<ModuleHost>,
         actor: F,
@@ -174,6 +177,7 @@ impl ClientConnection {
         });
         let this = Self {
             sender,
+            database_address,
             database_instance_id,
             module,
             module_rx,
@@ -195,6 +199,7 @@ impl ClientConnection {
         let module = module_rx.borrow_and_update().clone();
         Self {
             sender: Arc::new(ClientConnectionSender::dummy(id, protocol)),
+            database_address: Address::zero(),
             database_instance_id,
             module,
             module_rx,

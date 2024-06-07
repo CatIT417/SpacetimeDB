@@ -24,12 +24,12 @@ metrics_group!(
 
         #[name = spacetime_websocket_sent]
         #[help = "Number of websocket messages sent to client"]
-        #[labels(identity: Identity)]
+        #[labels(db: Address, client: Identity)]
         pub websocket_sent: IntCounterVec,
 
         #[name = spacetime_websocket_sent_msg_size]
         #[help = "The size of messages sent to connected sessions"]
-        #[labels(identity: Identity)]
+        #[labels(db: Address, client: Identity)]
         pub websocket_sent_msg_size: HistogramVec,
 
         #[name = spacetime_worker_instance_operation_queue_length]
