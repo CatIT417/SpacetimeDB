@@ -1,0 +1,15 @@
+[package]
+name = "spacetimedb-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file = "LICENSE"
+description = "Spacetime SQL Parser"
+
+[dependencies]
+spacetimedb-lib.workspace = true
+derive_more.workspace = true
+error-stack.workspace = true
+itertools.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true
