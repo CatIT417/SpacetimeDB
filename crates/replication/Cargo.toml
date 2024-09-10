@@ -1,0 +1,11 @@
+[package]
+name = "replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omnipaxos = {git = "https://github.com/haraldng/omnipaxos", rev="5643fbdcea239e265fba6753f2bc1812ebcf8906"}
+omnipaxos_storage = {git = "https://github.com/haraldng/omnipaxos", rev="5643fbdcea239e265fba6753f2bc1812ebcf8906"}
+serde.workspace = true
+tokio.workspace = true
