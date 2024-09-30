@@ -2,11 +2,7 @@
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
-  </PropertyGroup>
-
-  <PropertyGroup>
-    <IsPackable>false</IsPackable>
-    <DefaultItemExcludes>$(DefaultItemExcludes);snapshots/**/*</DefaultItemExcludes>
+    <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
   <ItemGroup>
