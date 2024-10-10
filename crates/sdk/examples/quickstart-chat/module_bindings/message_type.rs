@@ -12,7 +12,7 @@ use spacetimedb_sdk::{
 #[sats(crate = __lib)]
 pub struct Message {
     pub sender: __sdk::Identity,
-    pub sent: u64,
+    pub sent: std::time::SystemTime,
     pub text: String,
 }
 
