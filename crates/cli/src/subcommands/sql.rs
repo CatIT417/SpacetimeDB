@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use crate::api::{from_json_seed, ClientApi, Connection, StmtResultJson};
-use clap::{Arg, ArgAction, ArgGroup, ArgMatches};
+use crate::common_args;
+use clap::{Arg, ArgAction, ArgMatches};
 use itertools::Itertools;
 use reqwest::RequestBuilder;
 use spacetimedb_lib::de::serde::SeedWrapper;
@@ -9,7 +10,8 @@ use spacetimedb_lib::sats::{satn, Typespace};
 use tabled::settings::Style;
 
 use crate::config::Config;
-use crate::util::{database_address, get_auth_header_only};
+use crate::errors::error_for_status;
+use crate::util::{database_identity, get_auth_header_only};
 
 pub fn cli() -> clap::Command {
     clap::Command::new("sql")
@@ -17,7 +19,7 @@ pub fn cli() -> clap::Command {
         .arg(
             Arg::new("database")
                 .required(true)
-                .help("The domain or address of the database you would like to query"),
+                .help("The name or identity of the database you would like to query"),
         )
         .arg(
             Arg::new("query")
@@ -30,48 +32,32 @@ pub fn cli() -> clap::Command {
                  .long("interactive")
                  .action(ArgAction::SetTrue)
                  .conflicts_with("query")
-                 .help("Runs an interactive command prompt for `SQL` expressions"),)
-        .group(
-            ArgGroup::new("mode")
-                .args(["interactive","query"])
-                .multiple(false)
-                .required(true)
-        )
+                 .help("Instead of using a query, run an interactive command prompt for `SQL` expressions"),)
         .arg(
-            Arg::new("as_identity")
-                .long("as-identity")
-                .short('i')
+            common_args::identity()
                 .conflicts_with("anon_identity")
                 .help("The identity to use for querying the database")
                 .long_help("The identity to use for querying the database. If no identity is provided, the default one will be used."),
         )
         .arg(
-            Arg::new("anon_identity")
-                .long("anon-identity")
-                .short('a')
-                .conflicts_with("as_identity")
-                .action(ArgAction::SetTrue)
-                .help("If this flag is present, no identity will be provided when querying the database")
+            common_args::anonymous()
         )
-        .arg(
-            Arg::new("server")
-                .long("server")
-                .short('s')
+        .arg(common_args::server()
                 .help("The nickname, host name or URL of the server hosting the database"),
         )
 }
 
 pub(crate) async fn parse_req(mut config: Config, args: &ArgMatches) -> Result<Connection, anyhow::Error> {
     let server = args.get_one::<String>("server").map(|s| s.as_ref());
-    let database = args.get_one::<String>("database").unwrap();
-    let as_identity = args.get_one::<String>("as_identity");
+    let database_name_or_identity = args.get_one::<String>("database").unwrap();
+    let identity = args.get_one::<String>("identity");
     let anon_identity = args.get_flag("anon_identity");
 
     Ok(Connection {
         host: config.get_host_url(server)?,
-        auth_header: get_auth_header_only(&mut config, anon_identity, as_identity, server).await?,
-        address: database_address(&config, database, server).await?,
-        database: database.to_string(),
+        auth_header: get_auth_header_only(&mut config, anon_identity, identity, server).await?,
+        database_identity: database_identity(&config, database_name_or_identity, server).await?,
+        database: database_name_or_identity.to_string(),
     })
 }
 
@@ -88,11 +74,8 @@ fn print_timings(now: Instant) {
 pub(crate) async fn run_sql(builder: RequestBuilder, sql: &str, with_stats: bool) -> Result<(), anyhow::Error> {
     let now = Instant::now();
 
-    let json = builder
-        .body(sql.to_owned())
-        .send()
+    let json = error_for_status(builder.body(sql.to_owned()).send().await?)
         .await?
-        .error_for_status()?
         .text()
         .await?;
 
@@ -135,7 +118,7 @@ fn stmt_result_to_table(stmt_result: &StmtResultJson) -> anyhow::Result<tabled::
             .elements
             .iter()
             .enumerate()
-            .map(|(i, e)| e.name.clone().unwrap_or_else(|| format!("column {i}"))),
+            .map(|(i, e)| e.name.clone().unwrap_or_else(|| format!("column {i}").into())),
     );
 
     let ty = Typespace::EMPTY.with_type(schema);
@@ -143,7 +126,7 @@ fn stmt_result_to_table(stmt_result: &StmtResultJson) -> anyhow::Result<tabled::
         let row = from_json_seed(row.get(), SeedWrapper(ty))?;
         builder.push_record(
             ty.with_values(&row)
-                .map(|col_val| satn::PsqlWrapper(col_val).to_string()),
+                .map(|value| satn::PsqlWrapper { ty: ty.ty(), value }.to_string()),
         );
     }
 

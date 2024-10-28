@@ -4,7 +4,7 @@ use crate::StandaloneEnv;
 use clap::ArgAction::SetTrue;
 use clap::{Arg, ArgMatches};
 use spacetimedb::config::{FilesGlobal, FilesLocal, SpacetimeDbFiles};
-use spacetimedb::db::{Config, FsyncPolicy, Storage};
+use spacetimedb::db::{Config, Storage};
 use spacetimedb::startup;
 use tokio::net::TcpListener;
 
@@ -25,7 +25,7 @@ impl ProgramMode {
     /// based on the mode we're running the program in.
     fn listen_addr(&self) -> &'static str {
         match self {
-            ProgramMode::Standalone => "0.0.0.0:80",
+            ProgramMode::Standalone => "0.0.0.0:3000",
             ProgramMode::CLI => "127.0.0.1:3000",
         }
     }
@@ -70,11 +70,6 @@ pub fn cli(mode: ProgramMode) -> clap::Command {
         .long("in-memory")
         .action(SetTrue)
         .help("If specified the database will run entirely in memory. After the process exits all data will be lost.");
-
-    let wal_fsync_arg = Arg::new("wal_fsync")
-        .long("wal-fsync")
-        .action(SetTrue)
-        .help("If specified the database will fsync on each commit.");
 
     // the default root for files, this *should* be the home directory unless it cannot be determined.
     let default_root = if let Some(dir) = dirs::home_dir() {
@@ -139,7 +134,6 @@ pub fn cli(mode: ProgramMode) -> clap::Command {
         .arg(jwt_pub_key_path_arg)
         .arg(jwt_priv_key_path_arg)
         .arg(in_memory_arg)
-        .arg(wal_fsync_arg)
         .after_help(mode.after_help())
 }
 
@@ -180,12 +174,7 @@ pub async fn exec(args: &ArgMatches) -> anyhow::Result<()> {
     } else {
         Storage::Disk
     };
-    let fsync = if args.get_flag("wal_fsync") {
-        FsyncPolicy::EveryTx
-    } else {
-        FsyncPolicy::Never
-    };
-    let config = Config { storage, fsync };
+    let config = Config { storage };
 
     banner();
     let exe_name = std::env::current_exe()?;
@@ -222,13 +211,14 @@ pub async fn exec(args: &ArgMatches) -> anyhow::Result<()> {
         set_env_with_warning("SPACETIMEDB_TRACY", "1");
     }
 
-    startup::configure_tracing();
+    startup::StartupOptions::default().configure();
 
     let ctx = StandaloneEnv::init(config).await?;
 
-    let service = router().with_state(ctx);
+    let service = router(ctx);
 
     let tcp = TcpListener::bind(listen_addr).await?;
+    socket2::SockRef::from(&tcp).set_nodelay(true)?;
     log::debug!("Starting SpacetimeDB listening on {}", tcp.local_addr().unwrap());
     axum::serve(tcp, service).await?;
     Ok(())

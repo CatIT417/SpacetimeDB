@@ -1,239 +1,273 @@
-use base64::Engine;
-use prost::Message as _;
-
-use crate::host::module_host::{DatabaseUpdate, EventStatus, ModuleEvent};
-use crate::identity::Identity;
-use crate::json::client_api::{
-    EventJson, FunctionCallJson, IdentityTokenJson, MessageJson, OneOffQueryResponseJson, OneOffTableJson,
-    TransactionUpdateJson,
-};
-use crate::protobuf::client_api::{event, message, Event, FunctionCall, IdentityToken, Message, TransactionUpdate};
-use spacetimedb_client_api_messages::client_api::{OneOffQueryResponse, OneOffTable};
-use spacetimedb_lib::Address;
-use spacetimedb_sats::relation::MemTable;
-
 use super::{DataMessage, Protocol};
+use crate::execution_context::WorkloadType;
+use crate::host::module_host::{EventStatus, ModuleEvent};
+use crate::host::ArgsTuple;
+use crate::messages::websocket as ws;
+use derive_more::From;
+use spacetimedb_client_api_messages::websocket::{
+    BsatnFormat, Compression, FormatSwitch, JsonFormat, WebsocketFormat, SERVER_MSG_COMPRESSION_TAG_BROTLI,
+    SERVER_MSG_COMPRESSION_TAG_GZIP, SERVER_MSG_COMPRESSION_TAG_NONE,
+};
+use spacetimedb_lib::identity::RequestId;
+use spacetimedb_lib::ser::serde::SerializeWrapper;
+use spacetimedb_lib::Address;
+use spacetimedb_sats::bsatn;
+use spacetimedb_vm::relation::MemTable;
+use std::sync::Arc;
+use std::time::Instant;
 
-/// A message sent from the server to the client. Because clients can request either text or binary messages,
-/// a server message needs to be encodable as either.
-pub trait ServerMessage: Sized {
-    fn serialize(self, protocol: Protocol) -> DataMessage {
-        match protocol {
-            Protocol::Text => self.serialize_text().to_json().into(),
-            Protocol::Binary => self.serialize_binary().encode_to_vec().into(),
+/// A server-to-client message which can be encoded according to a [`Protocol`],
+/// resulting in a [`ToProtocol::Encoded`] message.
+pub trait ToProtocol {
+    type Encoded;
+    /// Convert `self` into a [`Self::Encoded`] where rows and arguments are encoded with `protocol`.
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded;
+}
+
+pub(super) type SwitchedServerMessage = FormatSwitch<ws::ServerMessage<BsatnFormat>, ws::ServerMessage<JsonFormat>>;
+
+/// Serialize `msg` into a [`DataMessage`] containing a [`ws::ServerMessage`].
+///
+/// If `protocol` is [`Protocol::Binary`],
+/// the message will be conditionally compressed by this method according to `compression`.
+pub fn serialize(
+    msg: impl ToProtocol<Encoded = SwitchedServerMessage>,
+    protocol: Protocol,
+    compression: Compression,
+) -> DataMessage {
+    // TODO(centril, perf): here we are allocating buffers only to throw them away eventually.
+    // Consider pooling these allocations so that we reuse them.
+    match msg.to_protocol(protocol) {
+        FormatSwitch::Json(msg) => serde_json::to_string(&SerializeWrapper::new(msg)).unwrap().into(),
+        FormatSwitch::Bsatn(msg) => {
+            // First write the tag so that we avoid shifting the entire message at the end.
+            let mut msg_bytes = vec![SERVER_MSG_COMPRESSION_TAG_NONE];
+            bsatn::to_writer(&mut msg_bytes, &msg).unwrap();
+
+            // Conditionally compress the message.
+            let srv_msg = &msg_bytes[1..];
+            let msg_bytes = match ws::decide_compression(srv_msg.len(), compression) {
+                Compression::None => msg_bytes,
+                Compression::Brotli => {
+                    let mut out = vec![SERVER_MSG_COMPRESSION_TAG_BROTLI];
+                    ws::brotli_compress(srv_msg, &mut out);
+                    out
+                }
+                Compression::Gzip => {
+                    let mut out = vec![SERVER_MSG_COMPRESSION_TAG_GZIP];
+                    ws::gzip_compress(srv_msg, &mut out);
+                    out
+                }
+            };
+            msg_bytes.into()
         }
     }
-    fn serialize_text(self) -> MessageJson;
-    fn serialize_binary(self) -> Message;
 }
 
-pub struct IdentityTokenMessage {
-    pub identity: Identity,
-    pub identity_token: String,
-    pub address: Address,
+#[derive(Debug, From)]
+pub enum SerializableMessage {
+    Query(OneOffQueryResponseMessage),
+    Identity(IdentityTokenMessage),
+    Subscribe(SubscriptionUpdateMessage),
+    TxUpdate(TransactionUpdateMessage),
 }
 
-impl ServerMessage for IdentityTokenMessage {
-    fn serialize_text(self) -> MessageJson {
-        MessageJson::IdentityToken(IdentityTokenJson {
-            identity: self.identity,
-            token: self.identity_token,
-            address: self.address,
-        })
+impl SerializableMessage {
+    pub fn num_rows(&self) -> Option<usize> {
+        match self {
+            Self::Query(msg) => Some(msg.num_rows()),
+            Self::Subscribe(msg) => Some(msg.num_rows()),
+            Self::TxUpdate(msg) => Some(msg.num_rows()),
+            Self::Identity(_) => None,
+        }
     }
-    fn serialize_binary(self) -> Message {
-        Message {
-            r#type: Some(message::Type::IdentityToken(IdentityToken {
-                identity: self.identity.as_bytes().to_vec(),
-                token: self.identity_token,
-                address: self.address.as_slice().to_vec(),
+
+    pub fn workload(&self) -> Option<WorkloadType> {
+        match self {
+            Self::Query(_) => Some(WorkloadType::Sql),
+            Self::Subscribe(_) => Some(WorkloadType::Subscribe),
+            Self::TxUpdate(_) => Some(WorkloadType::Update),
+            Self::Identity(_) => None,
+        }
+    }
+}
+
+impl ToProtocol for SerializableMessage {
+    type Encoded = SwitchedServerMessage;
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded {
+        match self {
+            SerializableMessage::Query(msg) => msg.to_protocol(protocol),
+            SerializableMessage::Identity(msg) => msg.to_protocol(protocol),
+            SerializableMessage::Subscribe(msg) => msg.to_protocol(protocol),
+            SerializableMessage::TxUpdate(msg) => msg.to_protocol(protocol),
+        }
+    }
+}
+
+pub type IdentityTokenMessage = ws::IdentityToken;
+
+impl ToProtocol for IdentityTokenMessage {
+    type Encoded = SwitchedServerMessage;
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded {
+        match protocol {
+            Protocol::Text => FormatSwitch::Json(ws::ServerMessage::IdentityToken(self)),
+            Protocol::Binary => FormatSwitch::Bsatn(ws::ServerMessage::IdentityToken(self)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TransactionUpdateMessage {
+    pub event: Arc<ModuleEvent>,
+    pub database_update: SubscriptionUpdateMessage,
+}
+
+impl TransactionUpdateMessage {
+    fn num_rows(&self) -> usize {
+        self.database_update.num_rows()
+    }
+}
+
+impl ToProtocol for TransactionUpdateMessage {
+    type Encoded = SwitchedServerMessage;
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded {
+        fn convert<F: WebsocketFormat>(
+            event: Arc<ModuleEvent>,
+            request_id: Option<u32>,
+            upd: ws::DatabaseUpdate<F>,
+            conv_args: impl FnOnce(&ArgsTuple) -> F::Single,
+        ) -> ws::ServerMessage<F> {
+            let status = match &event.status {
+                EventStatus::Committed(_) => ws::UpdateStatus::Committed(upd),
+                EventStatus::Failed(errmsg) => ws::UpdateStatus::Failed(errmsg.clone().into()),
+                EventStatus::OutOfEnergy => ws::UpdateStatus::OutOfEnergy,
+            };
+
+            let args = conv_args(&event.function_call.args);
+
+            let tx_update = ws::TransactionUpdate {
+                timestamp: event.timestamp,
+                status,
+                caller_identity: event.caller_identity,
+                reducer_call: ws::ReducerCallInfo {
+                    reducer_name: event.function_call.reducer.to_owned().into(),
+                    reducer_id: event.function_call.reducer_id.into(),
+                    args,
+                    request_id: request_id.unwrap_or(0),
+                },
+                energy_quanta_used: event.energy_quanta_used,
+                host_execution_duration_micros: event.host_execution_duration.as_micros() as u64,
+                caller_address: event.caller_address.unwrap_or(Address::ZERO),
+            };
+
+            ws::ServerMessage::TransactionUpdate(tx_update)
+        }
+
+        let TransactionUpdateMessage { event, database_update } = self;
+        let update = database_update.database_update;
+        protocol.assert_matches_format_switch(&update);
+        let request_id = database_update.request_id;
+        match update {
+            FormatSwitch::Bsatn(update) => FormatSwitch::Bsatn(convert(event, request_id, update, |args| {
+                Vec::from(args.get_bsatn().clone()).into()
             })),
+            FormatSwitch::Json(update) => {
+                FormatSwitch::Json(convert(event, request_id, update, |args| args.get_json().clone()))
+            }
         }
     }
 }
 
-pub struct TransactionUpdateMessage<'a> {
-    pub event: &'a ModuleEvent,
-    pub database_update: DatabaseUpdate,
-}
-
-impl ServerMessage for TransactionUpdateMessage<'_> {
-    fn serialize_text(self) -> MessageJson {
-        let Self { event, database_update } = self;
-        let (status_str, errmsg) = match &event.status {
-            EventStatus::Committed(_) => ("committed", String::new()),
-            EventStatus::Failed(errmsg) => ("failed", errmsg.clone()),
-            EventStatus::OutOfEnergy => ("out_of_energy", String::new()),
-        };
-
-        let event = EventJson {
-            timestamp: event.timestamp.0,
-            status: status_str.to_string(),
-            caller_identity: event.caller_identity,
-            function_call: FunctionCallJson {
-                reducer: event.function_call.reducer.to_owned(),
-                args: event.function_call.args.get_json().clone(),
-            },
-            energy_quanta_used: event.energy_quanta_used.get(),
-            message: errmsg,
-            caller_address: event.caller_address.unwrap_or(Address::__DUMMY),
-        };
-
-        let subscription_update = database_update.into_json();
-        MessageJson::TransactionUpdate(TransactionUpdateJson {
-            event,
-            subscription_update,
-        })
-    }
-
-    fn serialize_binary(self) -> Message {
-        let Self { event, database_update } = self;
-        let (status, errmsg) = match &event.status {
-            EventStatus::Committed(_) => (event::Status::Committed, String::new()),
-            EventStatus::Failed(errmsg) => (event::Status::Failed, errmsg.clone()),
-            EventStatus::OutOfEnergy => (event::Status::OutOfEnergy, String::new()),
-        };
-
-        let event = Event {
-            timestamp: event.timestamp.0,
-            status: status.into(),
-            caller_identity: event.caller_identity.to_vec(),
-            function_call: Some(FunctionCall {
-                reducer: event.function_call.reducer.to_owned(),
-                arg_bytes: event.function_call.args.get_bsatn().clone().into(),
-            }),
-            message: errmsg,
-            energy_quanta_used: event.energy_quanta_used.get() as i64,
-            host_execution_duration_micros: event.host_execution_duration.as_micros() as u64,
-            caller_address: event.caller_address.unwrap_or(Address::zero()).as_slice().to_vec(),
-        };
-
-        let subscription_update = database_update.into_protobuf();
-
-        let tx_update = TransactionUpdate {
-            event: Some(event),
-            subscription_update: Some(subscription_update),
-        };
-
-        Message {
-            r#type: Some(message::Type::TransactionUpdate(tx_update)),
-        }
-    }
-}
-
-impl ServerMessage for &mut TransactionUpdateMessage<'_> {
-    fn serialize_text(self) -> MessageJson {
-        TransactionUpdateMessage {
-            event: self.event,
-            database_update: self.database_update.clone(),
-        }
-        .serialize_text()
-    }
-    fn serialize_binary(self) -> Message {
-        TransactionUpdateMessage {
-            event: self.event,
-            database_update: self.database_update.clone(),
-        }
-        .serialize_binary()
-    }
-}
-
+#[derive(Debug, Clone)]
 pub struct SubscriptionUpdateMessage {
-    pub database_update: DatabaseUpdate,
+    pub database_update: FormatSwitch<ws::DatabaseUpdate<BsatnFormat>, ws::DatabaseUpdate<JsonFormat>>,
+    pub request_id: Option<RequestId>,
+    pub timer: Option<Instant>,
 }
 
-impl ServerMessage for SubscriptionUpdateMessage {
-    fn serialize_text(self) -> MessageJson {
-        MessageJson::SubscriptionUpdate(self.database_update.into_json())
-    }
-
-    fn serialize_binary(self) -> Message {
-        Message {
-            r#type: Some(message::Type::SubscriptionUpdate(self.database_update.into_protobuf())),
-        }
-    }
-}
-
-pub struct CachedMessage<M> {
-    msg: M,
-    text: Option<String>,
-    binary: Option<Vec<u8>>,
-}
-
-impl<M> CachedMessage<M> {
-    pub fn new(msg: M) -> Self {
+impl SubscriptionUpdateMessage {
+    pub(crate) fn default_for_protocol(protocol: Protocol, request_id: Option<RequestId>) -> Self {
         Self {
-            msg,
-            text: None,
-            binary: None,
+            database_update: match protocol {
+                Protocol::Text => FormatSwitch::Json(<_>::default()),
+                Protocol::Binary => FormatSwitch::Bsatn(<_>::default()),
+            },
+            request_id,
+            timer: None,
+        }
+    }
+
+    fn num_rows(&self) -> usize {
+        match &self.database_update {
+            FormatSwitch::Bsatn(x) => x.num_rows(),
+            FormatSwitch::Json(x) => x.num_rows(),
         }
     }
 }
 
-impl<M> CachedMessage<M>
-where
-    for<'b> &'b mut M: ServerMessage,
-{
-    pub fn serialize(&mut self, protocol: Protocol) -> DataMessage {
-        match protocol {
-            Protocol::Text => self
-                .text
-                .get_or_insert_with(|| self.msg.serialize_text().to_json())
-                .clone()
-                .into(),
-            Protocol::Binary => self
-                .binary
-                .get_or_insert_with(|| self.msg.serialize_binary().encode_to_vec())
-                .clone()
-                .into(),
+impl ToProtocol for SubscriptionUpdateMessage {
+    type Encoded = SwitchedServerMessage;
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded {
+        let request_id = self.request_id.unwrap_or(0);
+        let total_host_execution_duration_micros = self.timer.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        protocol.assert_matches_format_switch(&self.database_update);
+        match self.database_update {
+            FormatSwitch::Bsatn(database_update) => {
+                FormatSwitch::Bsatn(ws::ServerMessage::InitialSubscription(ws::InitialSubscription {
+                    database_update,
+                    request_id,
+                    total_host_execution_duration_micros,
+                }))
+            }
+            FormatSwitch::Json(database_update) => {
+                FormatSwitch::Json(ws::ServerMessage::InitialSubscription(ws::InitialSubscription {
+                    database_update,
+                    request_id,
+                    total_host_execution_duration_micros,
+                }))
+            }
         }
     }
 }
 
+#[derive(Debug)]
 pub struct OneOffQueryResponseMessage {
     pub message_id: Vec<u8>,
     pub error: Option<String>,
     pub results: Vec<MemTable>,
+    pub total_host_execution_duration: u64,
 }
 
-impl ServerMessage for OneOffQueryResponseMessage {
-    fn serialize_text(self) -> MessageJson {
-        MessageJson::OneOffQueryResponse(OneOffQueryResponseJson {
-            message_id_base64: base64::engine::general_purpose::STANDARD.encode(self.message_id),
-            error: self.error,
-            result: self
+impl OneOffQueryResponseMessage {
+    fn num_rows(&self) -> usize {
+        self.results.iter().map(|t| t.data.len()).sum()
+    }
+}
+
+impl ToProtocol for OneOffQueryResponseMessage {
+    type Encoded = SwitchedServerMessage;
+    fn to_protocol(self, protocol: Protocol) -> Self::Encoded {
+        fn convert<F: WebsocketFormat>(msg: OneOffQueryResponseMessage) -> ws::ServerMessage<F> {
+            let tables = msg
                 .results
                 .into_iter()
-                .map(|table| OneOffTableJson {
-                    table_name: table.head.table_name,
-                    rows: table.data.into_iter().map(|row| row.data.elements).collect(),
+                .map(|table| ws::OneOffTable {
+                    table_name: table.head.table_name.clone(),
+                    rows: F::encode_list(table.data.into_iter()).0,
                 })
-                .collect(),
-        })
-    }
+                .collect();
+            ws::ServerMessage::OneOffQueryResponse(ws::OneOffQueryResponse {
+                message_id: msg.message_id.into(),
+                error: msg.error.map(Into::into),
+                tables,
+                total_host_execution_duration_micros: msg.total_host_execution_duration,
+            })
+        }
 
-    fn serialize_binary(self) -> Message {
-        Message {
-            r#type: Some(message::Type::OneOffQueryResponse(OneOffQueryResponse {
-                message_id: self.message_id,
-                error: self.error.unwrap_or_default(),
-                tables: self
-                    .results
-                    .into_iter()
-                    .map(|table| OneOffTable {
-                        table_name: table.head.table_name,
-                        row: table
-                            .data
-                            .into_iter()
-                            .map(|row| {
-                                let mut row_bytes = Vec::new();
-                                row.data.encode(&mut row_bytes);
-                                row_bytes
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            })),
+        match protocol {
+            Protocol::Text => FormatSwitch::Json(convert(self)),
+            Protocol::Binary => FormatSwitch::Bsatn(convert(self)),
         }
     }
 }

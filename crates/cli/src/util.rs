@@ -2,26 +2,30 @@ use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD as BASE_64_STD, Engine as _};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use spacetimedb_lib::name::{DnsLookupResponse, RegisterTldResult, ReverseDNSResponse};
-use spacetimedb_lib::{Address, AlgebraicType, Identity};
-use std::collections::HashMap;
+use spacetimedb_client_api_messages::name::{DnsLookupResponse, RegisterTldResult, ReverseDNSResponse};
+use spacetimedb_data_structures::map::HashMap;
+use spacetimedb_lib::{AlgebraicType, Identity};
 use std::io::Write;
 use std::path::Path;
 
 use crate::config::{Config, IdentityConfig};
 
-/// Determine the address of the `database`.
-pub async fn database_address(config: &Config, database: &str, server: Option<&str>) -> Result<Address, anyhow::Error> {
-    if let Ok(address) = Address::from_hex(database) {
-        return Ok(address);
+/// Determine the identity of the `database`.
+pub async fn database_identity(
+    config: &Config,
+    name_or_identity: &str,
+    server: Option<&str>,
+) -> Result<Identity, anyhow::Error> {
+    if let Ok(identity) = Identity::from_hex(name_or_identity) {
+        return Ok(identity);
     }
-    match spacetime_dns(config, database, server).await? {
-        DnsLookupResponse::Success { domain: _, address } => Ok(address),
+    match spacetime_dns(config, name_or_identity, server).await? {
+        DnsLookupResponse::Success { domain: _, identity } => Ok(identity),
         DnsLookupResponse::Failure { domain } => Err(anyhow::anyhow!("The dns resolution of `{}` failed.", domain)),
     }
 }
 
-/// Converts a name to a database address.
+/// Converts a name to a database identity.
 pub async fn spacetime_dns(
     config: &Config,
     domain: &str,
@@ -62,14 +66,14 @@ pub async fn spacetime_server_fingerprint(url: &str) -> anyhow::Result<String> {
     Ok(fingerprint)
 }
 
-/// Returns all known names for the given address.
+/// Returns all known names for the given identity.
 pub async fn spacetime_reverse_dns(
     config: &Config,
-    address: &str,
+    identity: &str,
     server: Option<&str>,
 ) -> Result<ReverseDNSResponse, anyhow::Error> {
     let client = reqwest::Client::new();
-    let url = format!("{}/database/reverse_dns/{}", config.get_host_url(server)?, address);
+    let url = format!("{}/database/reverse_dns/{}", config.get_host_url(server)?, identity);
     let res = client.get(url).send().await?.error_for_status()?;
     let bytes = res.bytes().await.unwrap();
     Ok(serde_json::from_slice(&bytes[..]).unwrap())
@@ -152,7 +156,7 @@ pub async fn select_identity_config(
         config
             .get_identity_config(identity_or_name)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No such identity credentials for identity: {}", identity_or_name))
+            .ok_or_else(|| anyhow::anyhow!("No identity credentials for identity \"{}\"", identity_or_name))
     } else {
         Ok(init_default(config, None, server).await?.identity_config)
     }
@@ -185,7 +189,7 @@ pub struct DescribeElementName {
 
 pub async fn describe_reducer(
     config: &mut Config,
-    database: Address,
+    database: Identity,
     server: Option<String>,
     reducer_name: String,
     anon_identity: bool,
@@ -344,13 +348,17 @@ pub fn host_or_url_to_host_and_protocol(host_or_url: &str) -> (&str, Option<&str
 /// Prompt the user for `y` or `n` from stdin.
 ///
 /// Return `false` unless the input is `y`.
-pub fn y_or_n(prompt: &str) -> anyhow::Result<bool> {
+pub fn y_or_n(force: bool, prompt: &str) -> anyhow::Result<bool> {
+    if force {
+        println!("Skipping confirmation due to --yes");
+        return Ok(true);
+    }
     let mut input = String::new();
-    print!("{} (y/n)", prompt);
+    print!("{} [y/N]", prompt);
     std::io::stdout().flush()?;
     std::io::stdin().read_line(&mut input)?;
-
-    Ok(input.trim() == "y")
+    let input = input.trim().to_lowercase();
+    Ok(input == "y" || input == "yes")
 }
 
 pub fn unauth_error_context<T>(res: anyhow::Result<T>, identity: &str, server: &str) -> anyhow::Result<T> {
@@ -359,9 +367,9 @@ pub fn unauth_error_context<T>(res: anyhow::Result<T>, identity: &str, server: &
             "Identity {identity} is not valid for server {server}.
 Has the server rotated its keys?
 Remove the outdated identity with:
-\tspacetime identity remove {identity}
+\tspacetime identity remove -i {identity}
 Generate a new identity with:
-\tspacetime identity new --no-email --server {server}"
+\tspacetime identity new --no-email --server {server} --default"
         )
     })
 }

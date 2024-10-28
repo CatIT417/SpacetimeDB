@@ -6,8 +6,10 @@ license-file = "LICENSE"
 description = "Primitives such as TableId and ColumnIndexAttribute"
 
 [dependencies]
-either.workspace = true
 bitflags.workspace = true
+either.workspace = true
+nohash-hasher.workspace = true
+itertools.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -1,12 +1,12 @@
-use crate::util::{contains_protocol, host_or_url_to_host_and_protocol};
+use crate::util::{contains_protocol, host_or_url_to_host_and_protocol, is_hex_identity};
 use anyhow::Context;
 use jsonwebtoken::DecodingKey;
 use serde::{Deserialize, Serialize};
 use spacetimedb::auth::identity::decode_token;
+use spacetimedb_fs_utils::{atomic_write, create_parent_dir};
 use spacetimedb_lib::Identity;
 use std::{
     fs,
-    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -106,13 +106,8 @@ pub struct RawConfig {
     server_configs: Vec<ServerConfig>,
 }
 
-const DEFAULT_HOST: &str = "127.0.0.1:3000";
-const DEFAULT_PROTOCOL: &str = "http";
-const DEFAULT_HOST_NICKNAME: &str = "local";
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    proj: RawConfig,
     home: RawConfig,
 }
 
@@ -125,13 +120,13 @@ const NO_DEFAULT_SERVER_ERROR_MESSAGE: &str = "No default server configuration.
 Set an existing server as the default with:
 \tspacetime server set-default <server>
 Or add a new server which will become the default:
-\tspacetime server add <url> --default";
+\tspacetime server add {server} <url> --default";
 
 fn no_such_server_error(server: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "No such saved server configuration: {server}
 Add a new server configuration with:
-\tspacetime server add <url>",
+\tspacetime server add {server} --url <url>",
     )
 }
 
@@ -141,25 +136,24 @@ fn hanging_default_server_context(server: &str) -> String {
 
 impl RawConfig {
     fn new_with_localhost() -> Self {
+        let local = ServerConfig {
+            default_identity: None,
+            host: "127.0.0.1:3000".to_string(),
+            protocol: "http".to_string(),
+            nickname: Some("local".to_string()),
+            ecdsa_public_key: None,
+        };
+        let testnet = ServerConfig {
+            default_identity: None,
+            host: "testnet.spacetimedb.com".to_string(),
+            protocol: "https".to_string(),
+            nickname: Some("testnet".to_string()),
+            ecdsa_public_key: None,
+        };
         RawConfig {
-            default_server: Some(DEFAULT_HOST_NICKNAME.to_string()),
+            default_server: local.nickname.clone(),
             identity_configs: Vec::new(),
-            server_configs: vec![
-                ServerConfig {
-                    default_identity: None,
-                    host: DEFAULT_HOST.to_string(),
-                    protocol: DEFAULT_PROTOCOL.to_string(),
-                    nickname: Some(DEFAULT_HOST_NICKNAME.to_string()),
-                    ecdsa_public_key: None,
-                },
-                ServerConfig {
-                    default_identity: None,
-                    host: "testnet.spacetimedb.com".to_string(),
-                    protocol: "https".to_string(),
-                    nickname: Some("testnet".to_string()),
-                    ecdsa_public_key: None,
-                },
-            ],
+            server_configs: vec![local, testnet],
         }
     }
 
@@ -392,7 +386,7 @@ Import an existing identity with:
                     anyhow::anyhow!(
                         "Cannot delete identities for server without saved identity: {server}
 Fetch the server's fingerprint with:
-\tspacetime server fingerprint {server}"
+\tspacetime server fingerprint -s {server}"
                     )
                 })?;
                 self.remove_identities_for_fingerprint(&fingerprint)?
@@ -409,7 +403,7 @@ Fetch the server's fingerprint with:
         let decoder = DecodingKey::from_ec_pem(fingerprint.as_bytes()).with_context(|| {
             "Cannot delete identities for server without saved identity: {server}
 Fetch the server's fingerprint with:
-\tspacetime server fingerprint {server}"
+\tspacetime server fingerprint -s {server}"
         })?;
 
         // TODO: use `Vec::extract_if` instead when it stabilizes.
@@ -461,7 +455,7 @@ Fetch the server's fingerprint with:
                 format!(
                     "No saved fingerprint for server: {server}
 Fetch the server's fingerprint with:
-\tspacetime server fingerprint {server}"
+\tspacetime server fingerprint -s {server}"
                 )
             })
             .map(|cfg| cfg.ecdsa_public_key.as_deref())
@@ -588,10 +582,7 @@ Fetch the server's fingerprint with:
 
 impl Config {
     pub fn default_server_name(&self) -> Option<&str> {
-        self.proj
-            .default_server
-            .as_deref()
-            .or(self.home.default_server.as_deref())
+        self.home.default_server.as_deref()
     }
 
     /// Add a `ServerConfig` to the home configuration.
@@ -650,8 +641,6 @@ impl Config {
     ///
     /// Returns the URL of the default server if `server` is `None`.
     ///
-    /// Entries in the project configuration supersede entries in the home configuration.
-    ///
     /// If `server` is `Some` and is a complete URL,
     /// including protocol and hostname,
     /// returns that URL without accessing the configuration.
@@ -659,9 +648,8 @@ impl Config {
     /// Returns an `Err` if:
     /// - `server` is `Some`, but not a complete URL,
     ///   and the supplied name does not refer to any server
-    ///   in either the project or the home configuration.
-    /// - `server` is `None`, but neither the home nor the project configuration
-    ///   has a default server.
+    ///   in the configuration.
+    /// - `server` is `None`, but the configuration does not have a default server.
     pub fn get_host_url(&self, server: Option<&str>) -> anyhow::Result<String> {
         Ok(format!("{}://{}", self.protocol(server)?, self.host(server)?))
     }
@@ -670,8 +658,6 @@ impl Config {
     ///
     /// Returns the hostname of the default server if `server` is `None`.
     ///
-    /// Entries in the project configuration supersede entries in the home configuration.
-    ///
     /// If `server` is `Some` and is a complete URL,
     /// including protocol and hostname,
     /// returns that hostname without accessing the configuration.
@@ -679,26 +665,24 @@ impl Config {
     /// Returns an `Err` if:
     /// - `server` is `Some`, but not a complete URL,
     ///   and the supplied name does not refer to any server
-    ///   in either the project or the home configuration.
-    /// - `server` is `None`, but neither the home nor the project configuration
-    ///   has a default server.
+    ///   in the configuration.
+    /// - `server` is `None`, but the configuration does not
+    ///   have a default server.
     pub fn host<'a>(&'a self, server: Option<&'a str>) -> anyhow::Result<&'a str> {
         if let Some(server) = server {
             if contains_protocol(server) {
                 Ok(host_or_url_to_host_and_protocol(server).0)
             } else {
-                self.proj.host(server).or_else(|_| self.home.host(server))
+                self.home.host(server)
             }
         } else {
-            self.proj.default_host().or_else(|_| self.home.default_host())
+            self.home.default_host()
         }
     }
 
     /// Get the protocol of the specified `server`, either `"http"` or `"https"`.
     ///
     /// Returns the protocol of the default server if `server` is `None`.
-    ///
-    /// Entries in the project configuration supersede entries in the home configuration.
     ///
     /// If `server` is `Some` and is a complete URL,
     /// including protocol and hostname,
@@ -708,31 +692,26 @@ impl Config {
     /// Returns an `Err` if:
     /// - `server` is `Some`, but not a complete URL,
     ///   and the supplied name does not refer to any server
-    ///   in either the project or the home configuration.
-    /// - `server` is `None`, but neither the home nor the project configuration
-    ///   has a default server.
+    ///   in the configuration.
+    /// - `server` is `None`, but the configuration does not have a default server.
     pub fn protocol<'a>(&'a self, server: Option<&'a str>) -> anyhow::Result<&'a str> {
         if let Some(server) = server {
             if contains_protocol(server) {
                 Ok(host_or_url_to_host_and_protocol(server).1.unwrap())
             } else {
-                self.proj.protocol(server).or_else(|_| self.home.protocol(server))
+                self.home.protocol(server)
             }
         } else {
-            self.proj.default_protocol().or_else(|_| self.home.default_protocol())
+            self.home.default_protocol()
         }
     }
 
     pub fn default_identity(&self, server: Option<&str>) -> anyhow::Result<&str> {
         if let Some(server) = server {
             let (host, _) = host_or_url_to_host_and_protocol(server);
-            self.proj
-                .default_identity(host)
-                .or_else(|_| self.home.default_identity(host))
+            self.home.default_identity(host)
         } else {
-            self.proj
-                .default_server_default_identity()
-                .or_else(|_| self.home.default_server_default_identity())
+            self.home.default_server_default_identity()
         }
     }
 
@@ -789,111 +768,74 @@ impl Config {
         &self.home.server_configs
     }
 
-    fn find_config_filename(config_dir: &PathBuf) -> Option<&'static str> {
-        let read_dir = fs::read_dir(config_dir).unwrap();
-        let filenames = [DOT_SPACETIME_FILENAME, SPACETIME_FILENAME, CONFIG_FILENAME];
-        let mut config_filename = None;
-        'outer: for path in read_dir {
-            for name in filenames {
-                if name == path.as_ref().unwrap().file_name().to_str().unwrap() {
-                    config_filename = Some(name);
-                    break 'outer;
-                }
-            }
-        }
-        config_filename
+    fn find_config_path(config_dir: &Path) -> Option<PathBuf> {
+        [DOT_SPACETIME_FILENAME, SPACETIME_FILENAME, CONFIG_FILENAME]
+            .iter()
+            .map(|filename| config_dir.join(filename))
+            .find(|path| path.exists())
     }
 
-    fn load_raw(config_dir: PathBuf, is_project: bool) -> RawConfig {
-        // If a config file overload has been specified, use that instead
-        if !is_project {
-            if let Some(config_path) = std::env::var_os("SPACETIME_CONFIG_FILE") {
-                return Self::load_from_file(config_path.as_ref());
-            }
+    fn system_config_path() -> PathBuf {
+        if let Some(config_path) = std::env::var_os("SPACETIME_CONFIG_FILE") {
+            config_path.into()
+        } else {
+            let mut config_path = dirs::home_dir().unwrap();
+            config_path.push(HOME_CONFIG_DIR);
+            Self::find_config_path(&config_path).unwrap_or_else(|| config_path.join(CONFIG_FILENAME))
         }
-        if !config_dir.exists() {
-            fs::create_dir_all(&config_dir).unwrap();
-        }
+    }
 
-        let config_filename = Self::find_config_filename(&config_dir);
-        let Some(config_filename) = config_filename else {
-            return if is_project {
-                // Return an empty config without creating a file.
-                RawConfig::default()
-            } else {
-                // Return a default config with http://127.0.0.1:3000 as the default server.
-                // Do not (yet) create a file.
-                // The config file will be created later by `Config::save` if necessary.
-                RawConfig::new_with_localhost()
+    fn load_from_file(config_path: &Path) -> anyhow::Result<RawConfig> {
+        let text = fs::read_to_string(config_path)?;
+        Ok(toml::from_str(&text)?)
+    }
+
+    pub fn load() -> anyhow::Result<Self> {
+        let home_path = Self::system_config_path();
+        let config = if home_path.exists() {
+            Self {
+                home: Self::load_from_file(&home_path)
+                    .inspect_err(|e| eprintln!("config file {home_path:?} is invalid: {e:#?}"))?,
+            }
+        } else {
+            let config = Self {
+                home: RawConfig::new_with_localhost(),
             };
+            config.save();
+            config
         };
-
-        let config_path = config_dir.join(config_filename);
-        Self::load_from_file(&config_path)
+        Ok(config)
     }
 
-    fn load_from_file(config_path: &Path) -> RawConfig {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(config_path)
-            .unwrap();
-
-        let mut text = String::new();
-        file.read_to_string(&mut text).unwrap();
-        toml::from_str(&text).unwrap()
-    }
-
-    pub fn load() -> Self {
-        let home_dir = dirs::home_dir().unwrap();
-        let home_config = Self::load_raw(home_dir.join(HOME_CONFIG_DIR), false);
-
-        // TODO(cloutiertyler): For now we're checking for a spacetime.toml file
-        // in the current directory. Eventually this should really be that we
-        // search parent directories above the current directory to find
-        // spacetime.toml files like a .gitignore file
-        let cur_dir = std::env::current_dir().expect("No current working directory!");
-        let cur_config = Self::load_raw(cur_dir, true);
-
-        Self {
-            home: home_config,
-            proj: cur_config,
-        }
-    }
-
+    #[doc(hidden)]
+    /// Used in tests.
     pub fn new_with_localhost() -> Self {
         Self {
             home: RawConfig::new_with_localhost(),
-            proj: RawConfig::default(),
         }
     }
 
     pub fn save(&self) {
-        let config_path = if let Some(config_path) = std::env::var_os("SPACETIME_CONFIG_FILE") {
-            PathBuf::from(&config_path)
-        } else {
-            let home_dir = dirs::home_dir().unwrap();
-            let config_dir = home_dir.join(HOME_CONFIG_DIR);
-            if !config_dir.exists() {
-                fs::create_dir_all(&config_dir).unwrap();
-            }
+        let home_path = Self::system_config_path();
+        // If the `home_path` is in a directory, ensure it exists.
+        create_parent_dir(home_path.as_ref()).unwrap();
 
-            let config_filename = Self::find_config_filename(&config_dir).unwrap_or(CONFIG_FILENAME);
-            config_dir.join(config_filename)
-        };
+        let config = toml::to_string_pretty(&self.home).unwrap();
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(config_path)
-            .unwrap();
-
-        let str = toml::to_string_pretty(&self.home).unwrap();
-
-        file.set_len(0).unwrap();
-        file.write_all(str.as_bytes()).unwrap();
-        file.sync_all().unwrap();
+        eprintln!("Saving config to {}.", home_path.display());
+        // TODO: We currently have a race condition if multiple processes are modifying the config.
+        // If process X and process Y read the config, each make independent changes, and then save
+        // the config, the first writer will have its changes clobbered by the second writer.
+        //
+        // We used to use `Lockfile` to prevent this from happening, but we had other issues with
+        // that approach (see https://github.com/clockworklabs/SpacetimeDB/issues/1339, and the
+        // TODO in `lockfile.rs`).
+        //
+        // We should address this issue, but we currently don't expect it to arise very frequently
+        // (see https://github.com/clockworklabs/SpacetimeDB/pull/1341#issuecomment-2150857432).
+        if let Err(e) = atomic_write(&home_path, config) {
+            eprintln!("Could not save config file: {e}")
+        }
     }
 
     pub fn get_default_identity_config(&self, server: Option<&str>) -> anyhow::Result<&IdentityConfig> {
@@ -907,13 +849,22 @@ Import an existing identity with:
         })
     }
 
-    pub fn name_exists(&self, nickname: &str) -> bool {
-        for name in self.identity_configs().iter().map(|c| &c.nickname) {
-            if name.as_ref() == Some(&nickname.to_string()) {
-                return true;
-            }
+    pub fn name_exists(&self, name: &str) -> bool {
+        self.get_identity_config_by_name(name).is_some()
+    }
+
+    pub fn identity_exists(&self, identity: &Identity) -> bool {
+        self.get_identity_config_by_identity(identity).is_some()
+    }
+
+    pub fn can_set_name(&self, new_nickname: &str) -> Result<(), anyhow::Error> {
+        if self.name_exists(new_nickname) {
+            return Err(anyhow::anyhow!("An identity with that name already exists."));
         }
-        false
+        if is_hex_identity(new_nickname) {
+            return Err(anyhow::anyhow!("An identity name cannot be an identity."));
+        }
+        Ok(())
     }
 
     pub fn get_identity_config_by_name(&self, name: &str) -> Option<&IdentityConfig> {
@@ -1009,13 +960,9 @@ Import an existing identity with:
     pub fn set_default_identity_if_unset(&mut self, server: Option<&str>, identity: &str) -> anyhow::Result<()> {
         if let Some(server) = server {
             let (host, _) = host_or_url_to_host_and_protocol(server);
-            self.proj
-                .set_default_identity_if_unset(host, identity)
-                .or_else(|_| self.home.set_default_identity_if_unset(host, identity))
+            self.home.set_default_identity_if_unset(host, identity)
         } else {
-            self.proj
-                .default_server_set_default_identity_if_unset(identity)
-                .or_else(|_| self.home.default_server_set_default_identity_if_unset(identity))
+            self.home.default_server_set_default_identity_if_unset(identity)
         }
     }
 
@@ -1044,23 +991,16 @@ Update the server's fingerprint with:
             let (host, _) = host_or_url_to_host_and_protocol(server);
             Ok(host)
         } else {
-            self.proj
-                .default_server()
-                .or_else(|_| self.home.default_server())
-                .map(ServerConfig::nick_or_host)
+            self.home.default_server().map(ServerConfig::nick_or_host)
         }
     }
 
     pub fn server_fingerprint(&self, server: Option<&str>) -> anyhow::Result<Option<&str>> {
         if let Some(server) = server {
             let (host, _) = host_or_url_to_host_and_protocol(server);
-            self.proj
-                .server_fingerprint(host)
-                .or_else(|_| self.home.server_fingerprint(host))
+            self.home.server_fingerprint(host)
         } else {
-            self.proj
-                .default_server_fingerprint()
-                .or_else(|_| self.home.default_server_fingerprint())
+            self.home.default_server_fingerprint()
         }
     }
 

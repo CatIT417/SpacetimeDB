@@ -6,13 +6,12 @@
 use crate::{
     bflatn_from,
     indexes::{PageOffset, Size},
-    layout::{AlgebraicTypeLayout, HasLayout, PrimitiveType, ProductTypeElementLayout, VarLenType},
+    layout::{AlgebraicTypeLayout, PrimitiveType, ProductTypeElementLayout, VarLenType},
     table::RowRef,
-    util::slice_assume_init_ref,
 };
 use spacetimedb_sats::{
-    algebraic_value::ser::ValueSerializer, AlgebraicType, AlgebraicValue, ArrayValue, MapValue, ProductType,
-    ProductValue, SumValue,
+    algebraic_value::{ser::ValueSerializer, Packed},
+    i256, u256, AlgebraicType, AlgebraicValue, ArrayValue, ProductType, ProductValue, SumValue,
 };
 use std::{cell::Cell, mem};
 use thiserror::Error;
@@ -186,7 +185,8 @@ unsafe impl ReadColumn for bool {
         let data: *const bool = data.as_ptr().cast();
         // SAFETY: We trust that the `row_ref` refers to a valid, initialized row,
         // and that the `offset_in_bytes` refers to a column of type `Bool` within that row.
-        // A valid row can never have an uninitialized column or a column of an invalid value,
+        // A valid row can never have a column of an invalid value,
+        // and no byte in `Page.row_data` is ever uninit,
         // so `data` must be initialized as either 0 or 1.
         unsafe { *data }
     }
@@ -209,11 +209,6 @@ macro_rules! impl_read_column_number {
                 let col_offset = offset + PageOffset(layout.offset);
 
                 let data = page.get_row_data(col_offset, Size(mem::size_of::<Self>() as u16));
-                // SAFETY: We trust that the `row_ref` refers to a valid, initialized row,
-                // and that the `offset_in_bytes` refers to a column of type `Self` within that row.
-                // A valid row can never have an uninitialized column,
-                // so `data` must be initialized.
-                let data = unsafe { slice_assume_init_ref(data) };
                 let data: Result<[u8; mem::size_of::<Self>()], _> = data.try_into();
                 // SAFETY: `<[u8; N] as TryFrom<&[u8]>` succeeds if and only if the slice's length is `N`.
                 // We used `mem::size_of::<Self>()` as both the length of the slice and the array,
@@ -241,6 +236,8 @@ impl_read_column_number! {
     U64 => u64;
     I128 => i128;
     U128 => u128;
+    I256 => i256;
+    U256 => u256;
     F32 => f32;
     F64 => f64;
 }
@@ -263,7 +260,6 @@ unsafe impl ReadColumn for AlgebraicValue {
             bflatn_from::serialize_value(ValueSerializer, fixed_bytes, page, blob_store, &curr_offset, &layout.ty)
         };
 
-        debug_assert_eq!(curr_offset.get(), layout.offset as usize + layout.ty.size());
         debug_assert!(res.is_ok());
 
         // SAFETY: `ValueSerializer` is infallible.
@@ -307,33 +303,51 @@ macro_rules! impl_read_column_via_av {
 }
 
 impl_read_column_via_av! {
-    AlgebraicTypeLayout::VarLen(VarLenType::String) => into_string => String;
+    AlgebraicTypeLayout::VarLen(VarLenType::String) => into_string => Box<str>;
     AlgebraicTypeLayout::VarLen(VarLenType::Array(_)) => into_array => ArrayValue;
-    AlgebraicTypeLayout::VarLen(VarLenType::Map(_)) => into_map => MapValue;
     AlgebraicTypeLayout::Sum(_) => into_sum => SumValue;
     AlgebraicTypeLayout::Product(_) => into_product => ProductValue;
+}
+
+macro_rules! impl_read_column_via_from {
+    ($($base:ty => $target:ty);* $(;)*) => {
+        $(
+            unsafe impl ReadColumn for $target {
+                fn is_compatible_type(ty: &AlgebraicTypeLayout) -> bool {
+                    <$base>::is_compatible_type(ty)
+                }
+
+                unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
+                    // SAFETY: We use `$base`'s notion of compatible types, so we can forward promises.
+                    <$target>::from(unsafe { <$base>::unchecked_read_column(row_ref, layout) })
+                }
+            }
+        )*
+    };
+}
+
+impl_read_column_via_from! {
+    u16 => spacetimedb_primitives::ColId;
+    u32 => spacetimedb_primitives::TableId;
+    u32 => spacetimedb_primitives::IndexId;
+    u32 => spacetimedb_primitives::ConstraintId;
+    u32 => spacetimedb_primitives::SequenceId;
+    u128 => Packed<u128>;
+    i128 => Packed<i128>;
+    u256 => Box<u256>;
+    i256 => Box<i256>;
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{
-        blob_store::HashMapBlobStore, indexes::SquashedOffset, proptest_sats::generate_typed_row, table::Table,
-    };
+    use crate::blob_store::HashMapBlobStore;
+    use crate::table::test::table;
     use proptest::{prelude::*, prop_assert_eq, proptest, test_runner::TestCaseResult};
-    use spacetimedb_sats::{
-        db::def::{TableDef, TableSchema},
-        product,
-    };
-
-    fn table(ty: ProductType) -> Table {
-        let def = TableDef::from_product("", ty);
-        let schema = TableSchema::from_def(0.into(), def);
-        Table::new(schema, SquashedOffset::COMMITTED_STATE)
-    }
+    use spacetimedb_sats::{product, proptest::generate_typed_row};
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2048))]
+        #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 2048 }))]
 
         #[test]
         /// Test that `AlgebraicValue::read_column` returns expected values.
@@ -345,12 +359,10 @@ mod test {
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty);
 
-            let (_, ptr) = table.insert(&mut blob_store, &val).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
-            let row_ref = table.get_row_ref(&blob_store, ptr).unwrap();
-
-            for (idx, orig_col_value) in val.elements.into_iter().enumerate() {
-                let read_col_value = AlgebraicValue::read_column(row_ref, idx).unwrap();
+            for (idx, orig_col_value) in val.into_iter().enumerate() {
+                let read_col_value = row_ref.read_col::<AlgebraicValue>(idx).unwrap();
                 prop_assert_eq!(orig_col_value, read_col_value);
             }
         }
@@ -363,11 +375,9 @@ mod test {
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty.clone());
 
-            let (_, ptr) = table.insert(&mut blob_store, &val).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
-            let row_ref = table.get_row_ref(&blob_store, ptr).unwrap();
-
-            for (idx, col_ty) in ty.elements.into_iter().enumerate() {
+            for (idx, col_ty) in ty.elements.iter().enumerate() {
                 assert_wrong_type_error::<u8>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U8)?;
                 assert_wrong_type_error::<i8>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I8)?;
                 assert_wrong_type_error::<u16>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U16)?;
@@ -378,10 +388,12 @@ mod test {
                 assert_wrong_type_error::<i64>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I64)?;
                 assert_wrong_type_error::<u128>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U128)?;
                 assert_wrong_type_error::<i128>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I128)?;
+                assert_wrong_type_error::<u256>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U256)?;
+                assert_wrong_type_error::<i256>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I256)?;
                 assert_wrong_type_error::<f32>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F32)?;
                 assert_wrong_type_error::<f64>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F64)?;
                 assert_wrong_type_error::<bool>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::Bool)?;
-                assert_wrong_type_error::<String>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::String)?;
+                assert_wrong_type_error::<Box<str>>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::String)?;
             }
         }
 
@@ -393,13 +405,11 @@ mod test {
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty.clone());
 
-            let (_, ptr) = table.insert(&mut blob_store, &val).unwrap();
-
-            let row_ref = table.get_row_ref(&blob_store, ptr).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
             let oob = ty.elements.len();
 
-            match AlgebraicValue::read_column(row_ref, oob) {
+            match row_ref.read_col::<AlgebraicValue>(oob) {
                 Err(TypeError::IndexOutOfBounds { desired, found }) => {
                     prop_assert_eq!(desired, oob);
                     // Constructing a table changes the `ProductType` by adding column names
@@ -419,7 +429,7 @@ mod test {
     }
 
     /// Assert, if and only if `col_ty` is not `correct_col_ty`,
-    /// that `Col::read_column(row_ref, col_idx)` returns a `TypeError::WrongType`.
+    /// that `row_ref.read_col::<Col>(col_idx)` returns a `TypeError::WrongType`.
     ///
     /// If `col_ty == correct_col_ty`, do nothing.
     fn assert_wrong_type_error<Col: ReadColumn + PartialEq + std::fmt::Debug>(
@@ -429,7 +439,7 @@ mod test {
         correct_col_ty: AlgebraicType,
     ) -> TestCaseResult {
         if col_ty != &correct_col_ty {
-            match Col::read_column(row_ref, col_idx) {
+            match row_ref.read_col::<Col>(col_idx) {
                 Err(TypeError::WrongType { desired, found }) => {
                     prop_assert_eq!(desired, std::any::type_name::<Col>());
                     prop_assert_eq!(&found, col_ty);
@@ -441,7 +451,7 @@ mod test {
         Ok(())
     }
 
-    /// Define a test or tests which construct a row containing a known value of a known type,
+    /// Define a test or tests which constructs a row containing a known value of a known type,
     /// then uses `ReadColumn::read_column` to extract that type as a native type,
     /// e.g. a Rust integer,
     /// and asserts that the extracted value is as expected.
@@ -453,10 +463,9 @@ mod test {
                 let mut table = table(ProductType::from_iter([$algebraic_type]));
 
                 let val: $rust_type = $val;
-                let (_, ptr) = table.insert(&mut blob_store, &product![val.clone()]).unwrap();
-                let row_ref = table.get_row_ref(&blob_store, ptr).unwrap();
+                let (_, row_ref) = table.insert(&mut blob_store, &product![val.clone()]).unwrap();
 
-                assert_eq!(val, <$rust_type as ReadColumn>::read_column(row_ref, 0).unwrap());
+                assert_eq!(val, row_ref.read_col::<$rust_type>(0).unwrap());
             }
         };
 
@@ -479,21 +488,28 @@ mod test {
         read_column_u64 { AlgebraicType::U64 => u64 = 0xa5a5a5a5_a5a5a5a5 };
         read_column_i128 { AlgebraicType::I128 => i128 = i128::MAX };
         read_column_u128 { AlgebraicType::U128 => u128 = 0xa5a5a5a5_a5a5a5a5_a5a5a5a5_a5a5a5a5 };
+        read_column_i256 { AlgebraicType::I256 => i256 = i256::MAX };
+        read_column_u256 { AlgebraicType::U256 => u256 =
+            u256::from_words(
+                0xa5a5a5a5_a5a5a5a5_a5a5a5a5_a5a5a5a5,
+                0xa5a5a5a5_a5a5a5a5_a5a5a5a5_a5a5a5a5
+            )
+        };
 
         read_column_f32 { AlgebraicType::F32 => f32 = 1.0 };
         read_column_f64 { AlgebraicType::F64 => f64 = 1.0 };
 
         read_column_bool { AlgebraicType::Bool => bool = true };
 
-        read_column_empty_string { AlgebraicType::String => String = "".to_string() };
+        read_column_empty_string { AlgebraicType::String => Box<str> = "".into() };
 
         // Use a short string which fits in a single granule.
-        read_column_short_string { AlgebraicType::String => String = "short string".to_string() };
+        read_column_short_string { AlgebraicType::String => Box<str> = "short string".into() };
 
         // Use a medium-sized string which takes multiple granules.
-        read_column_medium_string { AlgebraicType::String => String = "medium string.".repeat(16) };
+        read_column_medium_string { AlgebraicType::String => Box<str> = "medium string.".repeat(16).into() };
 
         // Use a long string which will hit the blob store.
-        read_column_long_string { AlgebraicType::String => String = "long string. ".repeat(2048) };
+        read_column_long_string { AlgebraicType::String => Box<str> = "long string. ".repeat(2048).into() };
     }
 }

@@ -2,12 +2,13 @@
 //! without relying on types in third party libraries like `bytes::Bytes`, etc.
 //! Meant to be kept slim and trim for use across both native and WASM.
 
-use std::cell::Cell;
-use std::fmt;
-use std::str::Utf8Error;
+use crate::{i256, u256};
+use core::cell::Cell;
+use core::fmt;
+use core::str::Utf8Error;
 
 /// An error that occurred when decoding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     /// Not enough data was provided in the input.
     BufferLength {
@@ -16,7 +17,7 @@ pub enum DecodeError {
         given: usize,
     },
     /// The tag does not exist for the sum.
-    InvalidTag,
+    InvalidTag { tag: u8, sum_name: Option<String> },
     /// Expected data to be UTF-8 but it wasn't.
     InvalidUtf8,
     /// Custom error not in the other variants of `DecodeError`.
@@ -31,7 +32,13 @@ impl fmt::Display for DecodeError {
                 expected,
                 given,
             } => write!(f, "data too short for {for_type}: Expected {expected}, given {given}"),
-            DecodeError::InvalidTag => f.write_str("invalid tag for sum"),
+            DecodeError::InvalidTag { tag, sum_name } => {
+                write!(
+                    f,
+                    "unknown tag {tag:#x} for sum type {}",
+                    sum_name.as_deref().unwrap_or("<unknown>")
+                )
+            }
             DecodeError::InvalidUtf8 => f.write_str("invalid utf8"),
             DecodeError::Other(err) => f.write_str(err),
         }
@@ -83,6 +90,11 @@ pub trait BufWriter {
         self.put_slice(&val.to_le_bytes())
     }
 
+    /// Writes a `u256` to the buffer in little-endian (LE) encoding.
+    fn put_u256(&mut self, val: u256) {
+        self.put_slice(&val.to_le_bytes())
+    }
+
     /// Writes an `i8` to the buffer in little-endian (LE) encoding.
     fn put_i8(&mut self, val: i8) {
         self.put_slice(&val.to_le_bytes())
@@ -105,6 +117,11 @@ pub trait BufWriter {
 
     /// Writes an `i128` to the buffer in little-endian (LE) encoding.
     fn put_i128(&mut self, val: i128) {
+        self.put_slice(&val.to_le_bytes())
+    }
+
+    /// Writes an `i256` to the buffer in little-endian (LE) encoding.
+    fn put_i256(&mut self, val: i256) {
         self.put_slice(&val.to_le_bytes())
     }
 }
@@ -159,6 +176,14 @@ pub trait BufReader<'de> {
         self.get_array().map(u128::from_le_bytes)
     }
 
+    /// Reads a `u256` in little endian (LE) encoding from the input.
+    ///
+    /// This method is provided for convenience
+    /// and is derived from [`get_slice`](BufReader::get_slice)'s definition.
+    fn get_u256(&mut self) -> Result<u256, DecodeError> {
+        self.get_array().map(u256::from_le_bytes)
+    }
+
     /// Reads an `i8` in little endian (LE) encoding from the input.
     ///
     /// This method is provided for convenience
@@ -197,6 +222,14 @@ pub trait BufReader<'de> {
     /// and is derived from [`get_slice`](BufReader::get_slice)'s definition.
     fn get_i128(&mut self) -> Result<i128, DecodeError> {
         self.get_array().map(i128::from_le_bytes)
+    }
+
+    /// Reads an `i256` in little endian (LE) encoding from the input.
+    ///
+    /// This method is provided for convenience
+    /// and is derived from [`get_slice`](BufReader::get_slice)'s definition.
+    fn get_i256(&mut self) -> Result<i256, DecodeError> {
+        self.get_array().map(i256::from_le_bytes)
     }
 
     /// Reads an array of type `[u8; C]` from the input.
@@ -244,6 +277,25 @@ impl BufWriter for CountWriter {
     }
 }
 
+/// A [`BufWriter`] that writes the bytes to two writers `W1` and `W2`.
+pub struct TeeWriter<W1, W2> {
+    pub w1: W1,
+    pub w2: W2,
+}
+
+impl<W1: BufWriter, W2: BufWriter> TeeWriter<W1, W2> {
+    pub fn new(w1: W1, w2: W2) -> Self {
+        Self { w1, w2 }
+    }
+}
+
+impl<W1: BufWriter, W2: BufWriter> BufWriter for TeeWriter<W1, W2> {
+    fn put_slice(&mut self, slice: &[u8]) {
+        self.w1.put_slice(slice);
+        self.w2.put_slice(slice);
+    }
+}
+
 impl<'de> BufReader<'de> for &'de [u8] {
     fn get_slice(&mut self, size: usize) -> Result<&'de [u8], DecodeError> {
         if self.len() < size {
@@ -264,6 +316,7 @@ impl<'de> BufReader<'de> for &'de [u8] {
 }
 
 /// A cursor based [`BufReader<'de>`] implementation.
+#[derive(Debug)]
 pub struct Cursor<I> {
     /// The underlying input read from.
     pub buf: I,
@@ -283,13 +336,12 @@ impl<I> Cursor<I> {
 impl<'de, I: AsRef<[u8]>> BufReader<'de> for &'de Cursor<I> {
     fn get_slice(&mut self, size: usize) -> Result<&'de [u8], DecodeError> {
         // "Read" the slice `buf[pos..size]`.
-        let ret = self.buf.as_ref()[self.pos.get()..]
-            .get(..size)
-            .ok_or(DecodeError::BufferLength {
-                for_type: "Cursor".into(),
-                expected: (self.pos.get()..size).len(),
-                given: size,
-            })?;
+        let buf = &self.buf.as_ref()[self.pos.get()..];
+        let ret = buf.get(..size).ok_or_else(|| DecodeError::BufferLength {
+            for_type: "Cursor".into(),
+            expected: size,
+            given: buf.len(),
+        })?;
 
         // Advance the cursor by `size` bytes.
         self.pos.set(self.pos.get() + size);

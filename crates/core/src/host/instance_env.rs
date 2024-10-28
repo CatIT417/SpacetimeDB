@@ -1,31 +1,20 @@
-use parking_lot::{Mutex, MutexGuard};
-use smallvec::SmallVec;
-use spacetimedb_table::table::UniqueConstraintViolation;
-use std::ops::DerefMut;
-use std::sync::Arc;
-
-use super::scheduler::{ScheduleError, ScheduledReducerId, Scheduler};
-use super::timestamp::Timestamp;
-use crate::database_instance_context::DatabaseInstanceContext;
+use super::scheduler::{get_schedule_from_row, ScheduleError, Scheduler};
 use crate::database_logger::{BacktraceProvider, LogLevel, Record};
 use crate::db::datastore::locking_tx_datastore::MutTxId;
 use crate::error::{IndexError, NodesError};
 use crate::execution_context::ExecutionContext;
-use crate::vm::{DbProgram, TxMode};
-use spacetimedb_lib::filter::CmpArgs;
-use spacetimedb_lib::identity::AuthCtx;
-use spacetimedb_lib::operator::OpQuery;
-use spacetimedb_lib::{bsatn, ProductValue};
-use spacetimedb_primitives::{ColId, ColListBuilder, TableId};
-use spacetimedb_sats::buffer::BufWriter;
-use spacetimedb_sats::db::def::{IndexDef, IndexType};
-use spacetimedb_sats::relation::{FieldExpr, FieldName};
-use spacetimedb_sats::{ProductType, Typespace};
-use spacetimedb_vm::expr::{Code, ColumnOp};
+use crate::replica_context::ReplicaContext;
+use parking_lot::{Mutex, MutexGuard};
+use smallvec::SmallVec;
+use spacetimedb_primitives::{ColId, IndexId, TableId};
+use spacetimedb_sats::{bsatn::ToBsatn, AlgebraicValue, ProductValue};
+use spacetimedb_table::table::UniqueConstraintViolation;
+use std::ops::DerefMut;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct InstanceEnv {
-    pub dbic: Arc<DatabaseInstanceContext>,
+    pub replica_ctx: Arc<ReplicaContext>,
     pub scheduler: Scheduler,
     pub tx: TxSlot,
 }
@@ -33,6 +22,7 @@ pub struct InstanceEnv {
 #[derive(Clone, Default)]
 pub struct TxSlot {
     inner: Arc<Mutex<Option<MutTxId>>>,
+    ctx: Arc<Mutex<Option<ExecutionContext>>>,
 }
 
 #[derive(Default)]
@@ -41,26 +31,11 @@ struct ChunkedWriter {
     scratch_space: Vec<u8>,
 }
 
-impl BufWriter for ChunkedWriter {
-    fn put_slice(&mut self, slice: &[u8]) {
-        self.scratch_space.extend_from_slice(slice);
-    }
-}
-
 impl ChunkedWriter {
-    /// Reserves `len` additional bytes in the scratch space,
-    /// or does nothing if the capacity is already sufficient.
-    fn reserve_in_scratch(&mut self, len: usize) {
-        self.scratch_space.reserve(len);
-    }
-
     /// Flushes the data collected in the scratch space if it's larger than our
     /// chunking threshold.
     pub fn flush(&mut self) {
-        // For now, just send buffers over a certain fixed size.
-        const ITER_CHUNK_SIZE: usize = 64 * 1024;
-
-        if self.scratch_space.len() > ITER_CHUNK_SIZE {
+        if self.scratch_space.len() > spacetimedb_primitives::ROW_ITER_CHUNK_SIZE {
             // We intentionally clone here so that our scratch space is not
             // recreated with zero capacity (via `Vec::new`), but instead can
             // be `.clear()`ed in-place and reused.
@@ -83,48 +58,59 @@ impl ChunkedWriter {
         }
         self.chunks
     }
+
+    pub fn collect_iter(iter: impl Iterator<Item = impl ToBsatn>) -> Vec<Box<[u8]>> {
+        let mut chunked_writer = Self::default();
+        for item in iter {
+            // Write the item directly to the BSATN `chunked_writer` buffer.
+            item.to_bsatn_extend(&mut chunked_writer.scratch_space).unwrap();
+            // Flush at item boundaries.
+            chunked_writer.flush();
+        }
+        chunked_writer.into_chunks()
+    }
 }
 
 // Generic 'instance environment' delegated to from various host types.
 impl InstanceEnv {
-    pub fn new(dbic: Arc<DatabaseInstanceContext>, scheduler: Scheduler) -> Self {
+    pub fn new(replica_ctx: Arc<ReplicaContext>, scheduler: Scheduler) -> Self {
         Self {
-            dbic,
+            replica_ctx,
             scheduler,
             tx: TxSlot::default(),
         }
-    }
-
-    #[tracing::instrument(skip_all, fields(reducer=reducer))]
-    pub fn schedule(
-        &self,
-        reducer: String,
-        args: Vec<u8>,
-        time: Timestamp,
-    ) -> Result<ScheduledReducerId, ScheduleError> {
-        self.scheduler.schedule(reducer, args, time)
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn cancel_reducer(&self, id: ScheduledReducerId) {
-        self.scheduler.cancel(id)
     }
 
     fn get_tx(&self) -> Result<impl DerefMut<Target = MutTxId> + '_, GetTxError> {
         self.tx.get()
     }
 
-    #[tracing::instrument(skip_all)]
-    pub fn console_log(&self, level: LogLevel, record: &Record, bt: &dyn BacktraceProvider) {
-        self.dbic.logger.write(level, record, bt);
-        log::trace!("MOD({}): {}", self.dbic.address.to_abbreviated_hex(), record.message);
+    pub fn get_ctx(&self) -> Result<impl DerefMut<Target = ExecutionContext> + '_, GetTxError> {
+        self.tx.get_ctx()
     }
 
-    pub fn insert(&self, ctx: &ExecutionContext, table_id: TableId, buffer: &[u8]) -> Result<ProductValue, NodesError> {
-        let stdb = &*self.dbic.relational_db;
+    #[tracing::instrument(skip_all)]
+    pub fn console_log(&self, level: LogLevel, record: &Record, bt: &dyn BacktraceProvider) {
+        self.replica_ctx.logger.write(level, record, bt);
+        log::trace!(
+            "MOD({}): {}",
+            self.replica_ctx.database_identity.to_abbreviated_hex(),
+            record.message
+        );
+    }
+
+    pub fn insert(
+        &self,
+        ctx: &ExecutionContext,
+        table_id: TableId,
+        buffer: &[u8],
+    ) -> Result<AlgebraicValue, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
-        let ret = stdb
+
+        let (gen_cols, row_ptr) = stdb
             .insert_bytes_as_row(tx, table_id, buffer)
+            .map(|(gc, rr)| (gc, rr.pointer()))
             .inspect_err(|e| match e {
                 crate::error::DBError::Index(IndexError::UniqueConstraintViolation(UniqueConstraintViolation {
                     constraint_name: _,
@@ -142,14 +128,24 @@ impl InstanceEnv {
                 }
             })?;
 
-        Ok(ret)
+        if let Some((id_column, at_column)) = stdb.table_scheduled_id_and_at(ctx, tx, table_id)? {
+            let row_ref = tx.get(table_id, row_ptr)?.unwrap();
+            let (schedule_id, schedule_at) = get_schedule_from_row(&row_ref, id_column, at_column)
+                // NOTE(centril): Should never happen,
+                // as we successfully inserted and thus `ret` is verified against the table schema.
+                .map_err(|e| NodesError::ScheduleError(ScheduleError::DecodingError(e)))?;
+            self.scheduler
+                .schedule(table_id, schedule_id, schedule_at, id_column, at_column)
+                .map_err(NodesError::ScheduleError)?;
+        }
+
+        Ok(gen_cols)
     }
 
     /// Deletes all rows in the table identified by `table_id`
     /// where the column identified by `cols` equates to `value`.
     ///
     /// Returns an error if no rows were deleted or if the column wasn't found.
-    #[tracing::instrument(skip(self, ctx, value))]
     pub fn delete_by_col_eq(
         &self,
         ctx: &ExecutionContext,
@@ -157,11 +153,11 @@ impl InstanceEnv {
         col_id: ColId,
         value: &[u8],
     ) -> Result<u32, NodesError> {
-        let stdb = &*self.dbic.relational_db;
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
 
         // Interpret the `value` using the schema of the column.
-        let eq_value = stdb.decode_column(tx, table_id, col_id, value)?;
+        let eq_value = &stdb.decode_column(tx, table_id, col_id, value)?;
 
         // Find all rows in the table where the column data equates to `value`.
         let rows_to_delete = stdb
@@ -175,14 +171,38 @@ impl InstanceEnv {
         Ok(stdb.delete(tx, table_id, rows_to_delete))
     }
 
+    #[tracing::instrument(skip_all)]
+    pub fn datastore_delete_by_btree_scan_bsatn(
+        &self,
+        index_id: IndexId,
+        prefix: &[u8],
+        prefix_elems: ColId,
+        rstart: &[u8],
+        rend: &[u8],
+    ) -> Result<u32, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
+        let tx = &mut *self.tx.get()?;
+
+        // Find all rows in the table to delete.
+        let (table_id, iter) = stdb.btree_scan(tx, index_id, prefix, prefix_elems, rstart, rend)?;
+        // Re. `SmallVec`, `delete_by_field` only cares about 1 element, so optimize for that.
+        let rows_to_delete = iter.map(|row_ref| row_ref.pointer()).collect::<SmallVec<[_; 1]>>();
+
+        // Delete them and count how many we deleted.
+        Ok(stdb.delete(tx, table_id, rows_to_delete))
+    }
+
     /// Deletes all rows in the table identified by `table_id`
     /// where the rows match one in `relation`
     /// which is a bsatn encoding of `Vec<ProductValue>`.
     ///
-    /// Returns an error if no rows were deleted.
+    /// Returns an error if
+    /// - not in a transaction.
+    /// - the table didn't exist.
+    /// - a row couldn't be decoded to the table schema type.
     #[tracing::instrument(skip(self, relation))]
-    pub fn delete_by_rel(&self, table_id: TableId, relation: &[u8]) -> Result<u32, NodesError> {
-        let stdb = &*self.dbic.relational_db;
+    pub fn datastore_delete_all_by_eq_bsatn(&self, table_id: TableId, relation: &[u8]) -> Result<u32, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
 
         // Find the row schema using it to decode a vector of product values.
@@ -197,71 +217,43 @@ impl InstanceEnv {
 
     /// Returns the `table_id` associated with the given `table_name`.
     ///
-    /// Errors with `TableNotFound` if the table does not exist.
+    /// Errors with `GetTxError` if not in a transaction
+    /// and `TableNotFound` if the table does not exist.
     #[tracing::instrument(skip_all)]
-    pub fn get_table_id(&self, table_name: &str) -> Result<TableId, NodesError> {
-        let stdb = &*self.dbic.relational_db;
+    pub fn table_id_from_name(&self, table_name: &str) -> Result<TableId, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
 
         // Query the table id from the name.
-        let table_id = stdb
-            .table_id_from_name_mut(tx, table_name)?
-            .ok_or(NodesError::TableNotFound)?;
-
-        Ok(table_id)
+        stdb.table_id_from_name_mut(tx, table_name)?
+            .ok_or(NodesError::TableNotFound)
     }
 
-    /// Creates an index of type `index_type` and name `index_name`,
-    /// on a product of the given columns in `col_ids`,
-    /// in the table identified by `table_id`.
+    /// Returns the `index_id` associated with the given `index_name`.
     ///
-    /// Currently only single-column-indices are supported.
-    /// That is, `col_ids.len() == 1`, or the call will panic.
-    ///
-    /// Another limitation is on the `index_type`.
-    /// Only `btree` indices are supported as of now, i.e., `index_type == 0`.
-    /// When `index_type == 1` is passed, the call will happen
-    /// and on `index_type > 1`, an error is returned.
+    /// Errors with `GetTxError` if not in a transaction
+    /// and `IndexNotFound` if the index does not exist.
     #[tracing::instrument(skip_all)]
-    pub fn create_index(
-        &self,
-        index_name: String,
-        table_id: TableId,
-        index_type: u8,
-        col_ids: Vec<u8>,
-    ) -> Result<(), NodesError> {
-        let stdb = &*self.dbic.relational_db;
+    pub fn index_id_from_name(&self, index_name: &str) -> Result<IndexId, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
 
-        // TODO(george) This check should probably move towards src/db/index, but right
-        // now the API is pretty hardwired towards btrees.
-        let index_type = IndexType::try_from(index_type).map_err(|_| NodesError::BadIndexType(index_type))?;
-        match index_type {
-            IndexType::BTree => {}
-            IndexType::Hash => {
-                todo!("Hash indexes not yet supported")
-            }
-        };
+        // Query the index id from the name.
+        stdb.index_id_from_name_mut(tx, index_name)?
+            .ok_or(NodesError::IndexNotFound)
+    }
 
-        let columns = col_ids
-            .into_iter()
-            .map(Into::into)
-            .collect::<ColListBuilder>()
-            .build()
-            .expect("Attempt to create an index with zero columns");
+    /// Returns the number of rows in the table identified by `table_id`.
+    ///
+    /// Errors with `GetTxError` if not in a transaction
+    /// and `TableNotFound` if the table does not exist.
+    #[tracing::instrument(skip_all)]
+    pub fn datastore_table_row_count(&self, table_id: TableId) -> Result<u64, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
+        let tx = &mut *self.get_tx()?;
 
-        let is_unique = stdb.column_constraints(tx, table_id, &columns)?.has_unique();
-
-        let index = IndexDef {
-            columns,
-            index_name,
-            is_unique,
-            index_type,
-        };
-
-        stdb.create_index(tx, table_id, index)?;
-
-        Ok(())
+        // Query the row count for id.
+        stdb.table_row_count_mut(tx, table_id).ok_or(NodesError::TableNotFound)
     }
 
     /// Finds all rows in the table identified by `table_id`
@@ -271,139 +263,85 @@ impl InstanceEnv {
     ///
     /// Matching is defined by decoding of `value` to an `AlgebraicValue`
     /// according to the column's schema and then `Ord for AlgebraicValue`.
-    #[tracing::instrument(skip_all)]
-    pub fn iter_by_col_eq(
+    pub fn iter_by_col_eq_chunks(
         &self,
         ctx: &ExecutionContext,
         table_id: TableId,
         col_id: ColId,
         value: &[u8],
-    ) -> Result<Vec<u8>, NodesError> {
-        let stdb = &*self.dbic.relational_db;
+    ) -> Result<Vec<Box<[u8]>>, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.get_tx()?;
 
         // Interpret the `value` using the schema of the column.
-        let value = stdb.decode_column(tx, table_id, col_id, value)?;
+        let value = &stdb.decode_column(tx, table_id, col_id, value)?;
 
         // Find all rows in the table where the column data matches `value`.
-        // Concatenate and return these rows using bsatn encoding.
-        let results = stdb.iter_by_col_eq_mut(ctx, tx, table_id, col_id, value)?;
-        let mut bytes = Vec::new();
-        for result in results {
-            // Pre-allocate the capacity needed to write `result`.
-            bytes.reserve(bsatn::to_len(&result).unwrap());
-            // Write the ref directly to the BSATN `bytes` buffer.
-            bsatn::to_writer(&mut bytes, &result).unwrap();
-        }
-        Ok(bytes)
+        let chunks = ChunkedWriter::collect_iter(stdb.iter_by_col_eq_mut(ctx, tx, table_id, col_id, value)?);
+        Ok(chunks)
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn iter_chunks(&self, ctx: &ExecutionContext, table_id: TableId) -> Result<Vec<Box<[u8]>>, NodesError> {
-        let mut chunked_writer = ChunkedWriter::default();
-
-        let stdb = &*self.dbic.relational_db;
-        let tx = &mut *self.tx.get()?;
-
-        for row in stdb.iter_mut(ctx, tx, table_id)? {
-            // Pre-allocate the capacity needed to write `row`.
-            chunked_writer.reserve_in_scratch(bsatn::to_len(&row).unwrap());
-            // Write the ref directly to the BSATN `chunked_writer` buffer.
-            bsatn::to_writer(&mut chunked_writer, &row).unwrap();
-            // Flush at row boundaries.
-            chunked_writer.flush();
-        }
-
-        Ok(chunked_writer.into_chunks())
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn iter_filtered_chunks(
+    pub fn datastore_table_scan_bsatn_chunks(
         &self,
         ctx: &ExecutionContext,
         table_id: TableId,
-        filter: &[u8],
     ) -> Result<Vec<Box<[u8]>>, NodesError> {
-        use spacetimedb_lib::filter;
-
-        fn filter_to_column_op(table_name: &str, filter: filter::Expr) -> ColumnOp {
-            match filter {
-                filter::Expr::Cmp(filter::Cmp {
-                    op,
-                    args: CmpArgs { lhs_field, rhs },
-                }) => ColumnOp::Cmp {
-                    op: OpQuery::Cmp(op),
-                    lhs: Box::new(ColumnOp::Field(FieldExpr::Name(FieldName::positional(
-                        table_name,
-                        lhs_field as usize,
-                    )))),
-                    rhs: Box::new(ColumnOp::Field(match rhs {
-                        filter::Rhs::Field(rhs_field) => {
-                            FieldExpr::Name(FieldName::positional(table_name, rhs_field as usize))
-                        }
-                        filter::Rhs::Value(rhs_value) => FieldExpr::Value(rhs_value),
-                    })),
-                },
-                filter::Expr::Logic(filter::Logic { lhs, op, rhs }) => ColumnOp::Cmp {
-                    op: OpQuery::Logic(op),
-                    lhs: Box::new(filter_to_column_op(table_name, *lhs)),
-                    rhs: Box::new(filter_to_column_op(table_name, *rhs)),
-                },
-                filter::Expr::Unary(_) => todo!("unary operations are not yet supported"),
-            }
-        }
-
-        let stdb = &self.dbic.relational_db;
+        let stdb = &*self.replica_ctx.relational_db;
         let tx = &mut *self.tx.get()?;
 
-        let schema = stdb.schema_for_table_mut(tx, table_id)?;
-        let row_type = ProductType::from(&*schema);
+        let chunks = ChunkedWriter::collect_iter(stdb.iter_mut(ctx, tx, table_id)?);
+        Ok(chunks)
+    }
 
-        let filter = filter::Expr::from_bytes(
-            // TODO: looks like module typespace is currently not hooked up to instances;
-            // use empty typespace for now which should be enough for primitives
-            // but figure this out later
-            &Typespace::default(),
-            &row_type.elements,
-            filter,
-        )
-        .map_err(NodesError::DecodeFilter)?;
-        let q = spacetimedb_vm::dsl::query(&*schema).with_select(filter_to_column_op(&schema.table_name, filter));
-        //TODO: How pass the `caller` here?
-        let mut tx: TxMode = tx.into();
-        let p = &mut DbProgram::new(ctx, stdb, &mut tx, AuthCtx::for_current(self.dbic.identity));
-        let results = match spacetimedb_vm::eval::run_ast(p, q.into()) {
-            Code::Table(table) => table,
-            _ => unreachable!("query should always return a table"),
-        };
+    #[tracing::instrument(skip_all)]
+    pub fn datastore_btree_scan_bsatn_chunks(
+        &self,
+        index_id: IndexId,
+        prefix: &[u8],
+        prefix_elems: ColId,
+        rstart: &[u8],
+        rend: &[u8],
+    ) -> Result<Vec<Box<[u8]>>, NodesError> {
+        let stdb = &*self.replica_ctx.relational_db;
+        let tx = &mut *self.tx.get()?;
 
-        let mut chunked_writer = ChunkedWriter::default();
-
-        // write all rows and flush at row boundaries
-        for row in results.data {
-            row.data.encode(&mut chunked_writer);
-            chunked_writer.flush();
-        }
-
-        Ok(chunked_writer.into_chunks())
+        let (_, iter) = stdb.btree_scan(tx, index_id, prefix, prefix_elems, rstart, rend)?;
+        let chunks = ChunkedWriter::collect_iter(iter);
+        Ok(chunks)
     }
 }
 
 impl TxSlot {
-    pub fn set<T>(&self, tx: MutTxId, f: impl FnOnce() -> T) -> (MutTxId, T) {
+    pub fn set<T>(
+        &mut self,
+        ctx: ExecutionContext,
+        tx: MutTxId,
+        f: impl FnOnce() -> T,
+    ) -> (ExecutionContext, MutTxId, T) {
+        self.ctx.lock().replace(ctx);
         let prev = self.inner.lock().replace(tx);
         assert!(prev.is_none(), "reentrant TxSlot::set");
         let remove_tx = || self.inner.lock().take();
+
+        let remove_ctx = || self.ctx.lock().take();
+
         let res = {
-            scopeguard::defer_on_unwind! { remove_tx(); }
+            scopeguard::defer_on_unwind! { remove_ctx(); remove_tx();}
             f()
         };
+
+        let ctx = remove_ctx().expect("ctx was removed during transaction");
         let tx = remove_tx().expect("tx was removed during transaction");
-        (tx, res)
+        (ctx, tx, res)
     }
 
     pub fn get(&self) -> Result<impl DerefMut<Target = MutTxId> + '_, GetTxError> {
         MutexGuard::try_map(self.inner.lock(), |map| map.as_mut()).map_err(|_| GetTxError)
+    }
+
+    pub fn get_ctx(&self) -> Result<impl DerefMut<Target = ExecutionContext> + '_, GetTxError> {
+        MutexGuard::try_map(self.ctx.lock(), |map| map.as_mut()).map_err(|_| GetTxError)
     }
 }
 

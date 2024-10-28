@@ -48,7 +48,7 @@ fn test_domain() -> anyhow::Result<()> {
 
     let cdb = ControlDb::at(tmp.path())?;
 
-    let addr = Address::zero();
+    let addr = Identity::ZERO;
     let res = cdb.spacetime_insert_domain(&addr, domain.clone(), *ALICE, true)?;
     assert!(matches!(res, InsertDomainResult::Success { .. }));
 
@@ -92,16 +92,15 @@ fn test_decode() -> ResultTest<()> {
 
     let cdb = ControlDb::at(path)?;
 
-    let id = cdb.alloc_spacetime_identity()?;
+    // TODO: Use a random identity.
+    let id = Identity::ZERO;
 
     let db = Database {
         id: 0,
-        address: Default::default(),
-        identity: id,
+        database_identity: Default::default(),
+        owner_identity: id,
         host_type: HostType::Wasm,
-        num_replicas: 0,
-        program_bytes_address: Hash::ZERO,
-        publisher_address: Some(Address::zero()),
+        initial_program: Hash::ZERO,
     };
 
     cdb.insert_database(db.clone())?;
@@ -109,19 +108,19 @@ fn test_decode() -> ResultTest<()> {
     let dbs = cdb.get_databases()?;
 
     assert_eq!(dbs.len(), 1);
-    assert_eq!(dbs[0].identity, id);
+    assert_eq!(dbs[0].owner_identity, id);
 
-    let mut new_database_instance = DatabaseInstance {
+    let mut new_replica = Replica {
         id: 0,
         database_id: 1,
         node_id: 0,
         leader: true,
     };
 
-    let id = cdb.insert_database_instance(new_database_instance.clone())?;
-    new_database_instance.id = id;
+    let id = cdb.insert_replica(new_replica.clone())?;
+    new_replica.id = id;
 
-    let dbs = cdb.get_database_instances()?;
+    let dbs = cdb.get_replicas()?;
 
     assert_eq!(dbs.len(), 1);
     assert_eq!(dbs[0].id, id);

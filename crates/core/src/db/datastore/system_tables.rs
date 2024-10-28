@@ -1,58 +1,163 @@
-use crate::error::{DBError, TableError};
-use core::fmt;
+//! Schema definitions and accesses to the system tables,
+//! which store metadata about a SpacetimeDB database.
+//!
+//! When defining a new system table, remember to:
+//! - Define constants for its ID and name.
+//! - Name it in singular (`st_column` not `st_columns`).
+//! - Add a type `St(...)Row` to define its schema, deriving SpacetimeType.
+//!     - You will probably need to add a new ID type in `spacetimedb_primitives`,
+//!       with trait implementations in `spacetimedb_sats::{typespace, de::impl, ser::impl}`.
+//! - Add it to [`system_tables`], and define a constant for its index there.
+//! - Use [`st_fields_enum`] to define its column enum.
+//! - Register its schema in [`system_module_def`], making sure to call `validate_system_table` at the end of the function.
+
+use crate::db::relational_db::RelationalDB;
+use crate::error::DBError;
+use crate::execution_context::ExecutionContext;
+use derive_more::From;
+use spacetimedb_lib::db::auth::{StAccess, StTableType};
+use spacetimedb_lib::db::raw_def::v9::{RawIndexAlgorithm, RawSql};
+use spacetimedb_lib::db::raw_def::*;
+use spacetimedb_lib::de::{Deserialize, DeserializeOwned, Error};
+use spacetimedb_lib::ser::Serialize;
+use spacetimedb_lib::{Address, Identity, ProductValue, SpacetimeType};
 use spacetimedb_primitives::*;
-use spacetimedb_sats::db::auth::{StAccess, StTableType};
-use spacetimedb_sats::db::def::*;
+use spacetimedb_sats::algebraic_type::fmt::fmt_algebraic_type;
+use spacetimedb_sats::algebraic_value::ser::value_serialize;
 use spacetimedb_sats::hash::Hash;
 use spacetimedb_sats::product_value::InvalidFieldError;
 use spacetimedb_sats::{
-    impl_deserialize, impl_serialize, product, AlgebraicType, AlgebraicValue, ArrayValue, ProductValue,
+    impl_deserialize, impl_serialize, impl_st, u256, AlgebraicType, AlgebraicValue, ArrayValue, SumValue,
 };
+use spacetimedb_schema::def::{BTreeAlgorithm, ConstraintData, IndexAlgorithm, ModuleDef, UniqueConstraintData};
+use spacetimedb_schema::schema::{
+    ColumnSchema, ConstraintSchema, IndexSchema, RowLevelSecuritySchema, ScheduleSchema, Schema, SequenceSchema,
+    TableSchema,
+};
+use spacetimedb_table::table::RowRef;
+use spacetimedb_vm::errors::{ErrorType, ErrorVm};
+use spacetimedb_vm::ops::parse;
+use std::cell::RefCell;
+use std::str::FromStr;
 use strum::Display;
+use v9::{RawModuleDefV9Builder, TableType};
+
+use super::locking_tx_datastore::tx::TxId;
+use super::locking_tx_datastore::MutTxId;
 
 /// The static ID of the table that defines tables
-pub(crate) const ST_TABLES_ID: TableId = TableId(0);
+pub(crate) const ST_TABLE_ID: TableId = TableId(1);
 /// The static ID of the table that defines columns
-pub(crate) const ST_COLUMNS_ID: TableId = TableId(1);
+pub(crate) const ST_COLUMN_ID: TableId = TableId(2);
 /// The static ID of the table that defines sequences
-pub(crate) const ST_SEQUENCES_ID: TableId = TableId(2);
+pub(crate) const ST_SEQUENCE_ID: TableId = TableId(3);
 /// The static ID of the table that defines indexes
-pub(crate) const ST_INDEXES_ID: TableId = TableId(3);
+pub(crate) const ST_INDEX_ID: TableId = TableId(4);
 /// The static ID of the table that defines constraints
-pub(crate) const ST_CONSTRAINTS_ID: TableId = TableId(4);
+pub(crate) const ST_CONSTRAINT_ID: TableId = TableId(5);
 /// The static ID of the table that defines the stdb module associated with
 /// the database
-pub(crate) const ST_MODULE_ID: TableId = TableId(5);
+pub(crate) const ST_MODULE_ID: TableId = TableId(6);
+/// The static ID of the table that defines connected clients
+pub(crate) const ST_CLIENT_ID: TableId = TableId(7);
+/// The static ID of the table that defines system variables
+pub(crate) const ST_VAR_ID: TableId = TableId(8);
+/// The static ID of the table that defines scheduled tables
+pub(crate) const ST_SCHEDULED_ID: TableId = TableId(9);
 
-pub(crate) const ST_TABLES_NAME: &str = "st_table";
-pub(crate) const ST_COLUMNS_NAME: &str = "st_columns";
-pub(crate) const ST_SEQUENCES_NAME: &str = "st_sequence";
-pub(crate) const ST_INDEXES_NAME: &str = "st_indexes";
-pub(crate) const ST_CONSTRAINTS_NAME: &str = "st_constraints";
+/// The static ID of the table that defines the row level security (RLS) policies
+pub(crate) const ST_ROW_LEVEL_SECURITY_ID: TableId = TableId(10);
+pub(crate) const ST_TABLE_NAME: &str = "st_table";
+pub(crate) const ST_COLUMN_NAME: &str = "st_column";
+pub(crate) const ST_SEQUENCE_NAME: &str = "st_sequence";
+pub(crate) const ST_INDEX_NAME: &str = "st_index";
+pub(crate) const ST_CONSTRAINT_NAME: &str = "st_constraint";
 pub(crate) const ST_MODULE_NAME: &str = "st_module";
+pub(crate) const ST_CLIENT_NAME: &str = "st_client";
+pub(crate) const ST_SCHEDULED_NAME: &str = "st_scheduled";
+pub(crate) const ST_VAR_NAME: &str = "st_var";
+pub(crate) const ST_ROW_LEVEL_SECURITY_NAME: &str = "st_row_level_security";
+/// Reserved range of sequence values used for system tables.
+///
+/// Ids for user-created tables will start at `ST_RESERVED_SEQUENCE_RANGE + 1`.
+///
+/// The range applies to all sequences allocated by system tables, i.e. table-,
+/// sequence-, index-, and constraint-ids.
+/// > Note that column-ids are positional indices and not based on a sequence.
+///
+/// These ids can be referred to statically even for system tables introduced
+/// after a database was created, so as long as the range is not exceeded.
+///
+/// However unlikely it may seem, it is advisable to check for overflow in the
+/// test suite when adding sequences to system tables.
+pub(crate) const ST_RESERVED_SEQUENCE_RANGE: u32 = 4096;
 
 // This help to keep the correct order when bootstrapping
 #[allow(non_camel_case_types)]
 #[derive(Debug, Display)]
 pub enum SystemTable {
     st_table,
-    st_columns,
+    st_column,
     st_sequence,
-    st_indexes,
-    st_constraints,
+    st_index,
+    st_constraint,
+    st_row_level_security,
 }
-pub(crate) fn system_tables() -> [TableSchema; 6] {
+
+pub(crate) fn system_tables() -> [TableSchema; 10] {
     [
+        // The order should match the `id` of the system table, that start with [ST_TABLE_IDX].
         st_table_schema(),
-        st_columns_schema(),
-        st_indexes_schema(),
-        st_constraints_schema(),
+        st_column_schema(),
+        st_index_schema(),
+        st_constraint_schema(),
         st_module_schema(),
+        st_client_schema(),
+        st_var_schema(),
+        st_scheduled_schema(),
+        st_row_level_security_schema(),
         // Is important this is always last, so the starting sequence for each
         // system table is correct.
-        st_sequences_schema(),
+        st_sequence_schema(),
     ]
 }
+
+/// Types that represent the fields / columns of a system table.
+pub trait StFields: Copy + Sized {
+    /// Returns the column position of the system table field.
+    fn col_id(self) -> ColId;
+
+    /// Returns the column index of the system table field.
+    #[inline]
+    fn col_idx(self) -> usize {
+        self.col_id().idx()
+    }
+
+    /// Returns the column name of the system table field a static string slice.
+    fn name(self) -> &'static str;
+
+    /// Returns the column name of the system table field as a boxed slice.
+    #[inline]
+    fn col_name(self) -> Box<str> {
+        self.name().into()
+    }
+
+    /// Return all fields of this type, in order.
+    fn fields() -> &'static [Self];
+}
+
+// The following are indices into the array returned by [`system_tables`].
+pub(crate) const ST_TABLE_IDX: usize = 0;
+pub(crate) const ST_COLUMN_IDX: usize = 1;
+pub(crate) const ST_INDEX_IDX: usize = 2;
+pub(crate) const ST_CONSTRAINT_IDX: usize = 3;
+pub(crate) const ST_MODULE_IDX: usize = 4;
+pub(crate) const ST_CLIENT_IDX: usize = 5;
+pub(crate) const ST_VAR_IDX: usize = 6;
+pub(crate) const ST_SCHEDULED_IDX: usize = 7;
+pub(crate) const ST_ROW_LEVEL_SECURITY_IDX: usize = 8;
+// Must be the last index in the array.
+pub(crate) const ST_SEQUENCE_IDX: usize = 9;
 
 macro_rules! st_fields_enum {
     ($(#[$attr:meta])* enum $ty_name:ident { $($name:expr, $var:ident = $discr:expr,)* }) => {
@@ -62,33 +167,27 @@ macro_rules! st_fields_enum {
             $($var = $discr,)*
         }
 
-        impl $ty_name {
+        impl StFields for $ty_name {
             #[inline]
-            pub fn col_id(self) -> ColId {
-                ColId(self as u32)
+            fn col_id(self) -> ColId {
+                ColId(self as _)
             }
 
             #[inline]
-            pub fn col_idx(self) -> usize {
-                self.col_id().idx()
-            }
-
-            #[inline]
-            pub fn col_name(self) -> String {
-                self.name().into()
-            }
-
-            #[inline]
-            pub fn name(self) -> &'static str {
+            fn name(self) -> &'static str {
                 match self {
                     $(Self::$var => $name,)*
                 }
             }
+
+            fn fields() -> &'static [$ty_name] {
+                &[$($ty_name::$var,)*]
+            }
         }
 
-        impl From<$ty_name> for ColList {
+        impl From<$ty_name> for ColId {
             fn from(value: $ty_name) -> Self {
-                ColList::new(value.col_id())
+                value.col_id()
             }
         }
     }
@@ -100,6 +199,7 @@ st_fields_enum!(enum StTableFields {
     "table_name", TableName = 1,
     "table_type", TableType = 2,
     "table_access", TablesAccess = 3,
+    "table_primary_key", PrimaryKey = 4,
 });
 // WARNING: For a stable schema, don't change the field names and discriminants.
 st_fields_enum!(enum StColumnFields {
@@ -113,9 +213,7 @@ st_fields_enum!(enum StIndexFields {
     "index_id", IndexId = 0,
     "table_id", TableId = 1,
     "index_name", IndexName = 2,
-    "columns", Columns = 3,
-    "is_unique", IsUnique = 4,
-    "index_type", IndexType = 5,
+    "index_algorithm", IndexAlgorithm = 3,
 });
 // WARNING: For a stable schema, don't change the field names and discriminants.
 st_fields_enum!(
@@ -135,361 +233,421 @@ st_fields_enum!(
 st_fields_enum!(enum StConstraintFields {
     "constraint_id", ConstraintId = 0,
     "constraint_name", ConstraintName = 1,
-    "constraints", Constraints = 2,
-    "table_id", TableId = 3,
-    "columns", Columns = 4,
+    "table_id", TableId = 2,
+    "constraint_data", ConstraintData = 3,
+});
+// WARNING: For a stable schema, don't change the field names and discriminants.
+st_fields_enum!(enum StRowLevelSecurityFields {
+    "table_id", TableId = 0,
+    "sql", Sql = 1,
 });
 // WARNING: For a stable schema, don't change the field names and discriminants.
 st_fields_enum!(enum StModuleFields {
-    "program_hash", ProgramHash = 0,
-    "kind", Kind = 1,
-    "epoch", Epoch = 2,
+    "database_identity", DatabaseIdentity = 0,
+    "owner_identity", OwnerIdentity = 1,
+    "program_kind", ProgramKind = 2,
+    "program_hash", ProgramHash = 3,
+    "program_bytes", ProgramBytes = 4,
+    "module_version", ModuleVersion = 5,
+});
+// WARNING: For a stable schema, don't change the field names and discriminants.
+st_fields_enum!(enum StClientFields {
+    "identity", Identity = 0,
+    "address", Address = 1,
+});
+// WARNING: For a stable schema, don't change the field names and discriminants.
+st_fields_enum!(enum StVarFields {
+    "name", Name = 0,
+    "value", Value = 1,
 });
 
-/// System Table [ST_TABLES_NAME]
+st_fields_enum!(enum StScheduledFields {
+    "schedule_id", ScheduleId = 0,
+    "table_id", TableId = 1,
+    "reducer_name", ReducerName = 2,
+    "schedule_name", ScheduleName = 3,
+    "at_column", AtColumn = 4,
+});
+
+/// Helper method to check that a system table has the correct fields.
+/// Does not check field types since those aren't included in `StFields` types.
+/// If anything in here is not true, the system is completely broken, so it's fine to assert.
+fn validate_system_table<T: StFields + 'static>(def: &ModuleDef, table_name: &str) {
+    let table = def.table(table_name).expect("missing system table definition");
+    let fields = T::fields();
+    assert_eq!(table.columns.len(), fields.len());
+    for field in T::fields() {
+        let col = table
+            .columns
+            .get(field.col_id().idx())
+            .expect("missing system table field");
+        assert_eq!(&col.name[..], field.name());
+    }
+}
+
+/// See the comment on [`SYSTEM_MODULE_DEF`].
+fn system_module_def() -> ModuleDef {
+    let mut builder = RawModuleDefV9Builder::new();
+
+    let st_table_type = builder.add_type::<StTableRow>();
+    builder
+        .build_table(ST_TABLE_NAME, *st_table_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_auto_inc_primary_key(StTableFields::TableId)
+        .with_unique_constraint(StTableFields::TableName, None);
+
+    let st_raw_column_type = builder.add_type::<StColumnRow>();
+    builder
+        .build_table(ST_COLUMN_NAME, *st_raw_column_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_unique_constraint(
+            col_list![StColumnFields::TableId.col_id(), StColumnFields::ColPos.col_id()],
+            None,
+        );
+
+    let st_index_type = builder.add_type::<StIndexRow>();
+    builder
+        .build_table(ST_INDEX_NAME, *st_index_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_auto_inc_primary_key(StIndexFields::IndexId);
+    // TODO(1.0): unique constraint on name?
+
+    let st_sequence_type = builder.add_type::<StSequenceRow>();
+    builder
+        .build_table(ST_SEQUENCE_NAME, *st_sequence_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_auto_inc_primary_key(StSequenceFields::SequenceId);
+    // TODO(1.0): unique constraint on name?
+
+    let st_constraint_type = builder.add_type::<StConstraintRow>();
+    builder
+        .build_table(ST_CONSTRAINT_NAME, *st_constraint_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_auto_inc_primary_key(StConstraintFields::ConstraintId);
+    // TODO(1.0): unique constraint on name?
+
+    let st_row_level_security_type = builder.add_type::<StRowLevelSecurityRow>();
+    builder
+        .build_table(
+            ST_ROW_LEVEL_SECURITY_NAME,
+            *st_row_level_security_type.as_ref().expect("should be ref"),
+        )
+        .with_type(TableType::System)
+        .with_primary_key(StRowLevelSecurityFields::Sql)
+        .with_unique_constraint(StRowLevelSecurityFields::Sql, None)
+        .with_index(
+            RawIndexAlgorithm::BTree {
+                columns: StRowLevelSecurityFields::TableId.into(),
+            },
+            "accessor_name_doesnt_matter",
+            None,
+        );
+
+    let st_module_type = builder.add_type::<StModuleRow>();
+    builder
+        .build_table(ST_MODULE_NAME, *st_module_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System);
+    // TODO: add empty unique constraint here, once we've implemented those.
+
+    let st_client_type = builder.add_type::<StClientRow>();
+    builder
+        .build_table(ST_CLIENT_NAME, *st_client_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_unique_constraint(col_list![StClientFields::Identity, StClientFields::Address], None); // FIXME: this is a noop?
+
+    let st_schedule_type = builder.add_type::<StScheduledRow>();
+    builder
+        .build_table(ST_SCHEDULED_NAME, *st_schedule_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_unique_constraint(StScheduledFields::TableId, None)
+        .with_auto_inc_primary_key(StScheduledFields::ScheduleId);
+    // TODO(1.0): unique constraint on name?
+
+    let st_var_type = builder.add_type::<StVarRow>();
+    builder
+        .build_table(ST_VAR_NAME, *st_var_type.as_ref().expect("should be ref"))
+        .with_type(TableType::System)
+        .with_unique_constraint(StVarFields::Name, None)
+        .with_primary_key(StVarFields::Name);
+
+    let result = builder
+        .finish()
+        .try_into()
+        .expect("system table module is invalid, did you change it or add a validation rule it doesn't meet?");
+
+    validate_system_table::<StTableFields>(&result, ST_TABLE_NAME);
+    validate_system_table::<StColumnFields>(&result, ST_COLUMN_NAME);
+    validate_system_table::<StIndexFields>(&result, ST_INDEX_NAME);
+    validate_system_table::<StSequenceFields>(&result, ST_SEQUENCE_NAME);
+    validate_system_table::<StConstraintFields>(&result, ST_CONSTRAINT_NAME);
+    validate_system_table::<StRowLevelSecurityFields>(&result, ST_ROW_LEVEL_SECURITY_NAME);
+    validate_system_table::<StModuleFields>(&result, ST_MODULE_NAME);
+    validate_system_table::<StClientFields>(&result, ST_CLIENT_NAME);
+    validate_system_table::<StVarFields>(&result, ST_VAR_NAME);
+    validate_system_table::<StScheduledFields>(&result, ST_SCHEDULED_NAME);
+
+    result
+}
+
+lazy_static::lazy_static! {
+    /// The canonical definition of the system tables.
+    ///
+    /// It's important not to leak this `ModuleDef` or the `Def`s it contains outside this file.
+    /// You should only return `Schema`s from this file, not `Def`s!
+    ///
+    /// This is because `SYSTEM_MODULE_DEF` has a `Typespace` that is DISTINCT from the typespace used in the client module.
+    /// System `TableDef`s refer to this typespace, but client `TableDef`s refer to the client typespace.
+    /// This could easily result in confusing errors!
+    /// Fortunately, when converting from `TableDef` to `TableSchema`, all `AlgebraicType`s are resolved,
+    /// so that they are self-contained and do not refer to any `Typespace`.
+    static ref SYSTEM_MODULE_DEF: ModuleDef = system_module_def();
+}
+
+fn st_schema(name: &str, id: TableId) -> TableSchema {
+    let result = TableSchema::from_module_def(
+        &SYSTEM_MODULE_DEF,
+        SYSTEM_MODULE_DEF.table(name).expect("missing system table definition"),
+        (),
+        id,
+    );
+    result
+}
+
+fn st_table_schema() -> TableSchema {
+    st_schema(ST_TABLE_NAME, ST_TABLE_ID)
+}
+
+fn st_column_schema() -> TableSchema {
+    st_schema(ST_COLUMN_NAME, ST_COLUMN_ID)
+}
+
+fn st_index_schema() -> TableSchema {
+    st_schema(ST_INDEX_NAME, ST_INDEX_ID)
+}
+
+fn st_sequence_schema() -> TableSchema {
+    st_schema(ST_SEQUENCE_NAME, ST_SEQUENCE_ID)
+}
+
+fn st_constraint_schema() -> TableSchema {
+    st_schema(ST_CONSTRAINT_NAME, ST_CONSTRAINT_ID)
+}
+
+fn st_row_level_security_schema() -> TableSchema {
+    st_schema(ST_ROW_LEVEL_SECURITY_NAME, ST_ROW_LEVEL_SECURITY_ID)
+}
+
+pub(crate) fn st_module_schema() -> TableSchema {
+    st_schema(ST_MODULE_NAME, ST_MODULE_ID)
+}
+
+fn st_client_schema() -> TableSchema {
+    st_schema(ST_CLIENT_NAME, ST_CLIENT_ID)
+}
+
+fn st_scheduled_schema() -> TableSchema {
+    st_schema(ST_SCHEDULED_NAME, ST_SCHEDULED_ID)
+}
+
+pub fn st_var_schema() -> TableSchema {
+    st_schema(ST_VAR_NAME, ST_VAR_ID)
+}
+
+/// If `table_id` refers to a known system table, return its schema.
+///
+/// Used when restoring from a snapshot; system tables are reinstantiated with this schema,
+/// whereas user tables are reinstantiated with a schema computed from the snapshotted system tables.
+///
+/// This must be kept in sync with the set of system tables.
+pub(crate) fn system_table_schema(table_id: TableId) -> Option<TableSchema> {
+    match table_id {
+        ST_TABLE_ID => Some(st_table_schema()),
+        ST_COLUMN_ID => Some(st_column_schema()),
+        ST_SEQUENCE_ID => Some(st_sequence_schema()),
+        ST_INDEX_ID => Some(st_index_schema()),
+        ST_CONSTRAINT_ID => Some(st_constraint_schema()),
+        ST_ROW_LEVEL_SECURITY_ID => Some(st_row_level_security_schema()),
+        ST_MODULE_ID => Some(st_module_schema()),
+        ST_CLIENT_ID => Some(st_client_schema()),
+        ST_VAR_ID => Some(st_var_schema()),
+        ST_SCHEDULED_ID => Some(st_scheduled_schema()),
+        _ => None,
+    }
+}
+
+/// System Table [ST_TABLE_NAME]
 ///
 /// | table_id | table_name  | table_type | table_access |
 /// |----------|-------------|----------- |------------- |
 /// | 4        | "customers" | "user"     | "public"     |
-pub fn st_table_schema() -> TableSchema {
-    TableDef::new(
-        ST_TABLES_NAME.into(),
-        vec![
-            ColumnDef::sys(StTableFields::TableId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StTableFields::TableName.name(), AlgebraicType::String),
-            ColumnDef::sys(StTableFields::TableType.name(), AlgebraicType::String),
-            ColumnDef::sys(StTableFields::TablesAccess.name(), AlgebraicType::String),
-        ],
-    )
-    .with_type(StTableType::System)
-    .with_column_constraint(Constraints::primary_key_auto(), StTableFields::TableId.col_id())
-    .with_column_index(StTableFields::TableName.col_id(), true)
-    .into_schema(ST_TABLES_ID)
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StTableRow {
+    pub(crate) table_id: TableId,
+    pub(crate) table_name: Box<str>,
+    pub(crate) table_type: StTableType,
+    pub(crate) table_access: StAccess,
+    /// The primary key of the table.
+    /// This is a `ColId` everywhere else, but we make it a `ColList` here
+    /// for future compatibility in case we ever have composite primary keys.
+    pub(crate) table_primary_key: Option<ColList>,
 }
 
-/// System Table [ST_COLUMNS_NAME]
+impl TryFrom<RowRef<'_>> for StTableRow {
+    type Error = DBError;
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
+    }
+}
+
+impl From<StTableRow> for ProductValue {
+    fn from(x: StTableRow) -> Self {
+        to_product_value(&x)
+    }
+}
+
+/// A wrapper around `AlgebraicType` that acts like `AlgegbraicType::bytes()` for serialization purposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlgebraicTypeViaBytes(pub AlgebraicType);
+impl_st!([] AlgebraicTypeViaBytes, AlgebraicType::bytes());
+impl<'de> Deserialize<'de> for AlgebraicTypeViaBytes {
+    fn deserialize<D: spacetimedb_lib::de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = <&[u8]>::deserialize(deserializer)?;
+        let ty = AlgebraicType::decode(&mut &*bytes).map_err(D::Error::custom)?;
+        Ok(AlgebraicTypeViaBytes(ty))
+    }
+}
+thread_local! {
+    static ALGEBRAIC_TYPE_WRITE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+impl_serialize!([] AlgebraicTypeViaBytes, (self, ser) => {
+    ALGEBRAIC_TYPE_WRITE_BUF.with_borrow_mut(|buf| {
+        buf.clear();
+        self.0.encode(buf);
+        buf[..].serialize(ser)
+    })
+});
+impl From<AlgebraicType> for AlgebraicTypeViaBytes {
+    fn from(ty: AlgebraicType) -> Self {
+        Self(ty)
+    }
+}
+
+/// System Table [ST_COLUMN_NAME]
 ///
 /// | table_id | col_id | col_name | col_type            |
 /// |----------|---------|----------|--------------------|
 /// | 1        | 0       | "id"     | AlgebraicType::U32 |
-pub fn st_columns_schema() -> TableSchema {
-    TableDef::new(
-        ST_COLUMNS_NAME.into(),
-        vec![
-            ColumnDef::sys(StColumnFields::TableId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StColumnFields::ColPos.name(), AlgebraicType::U32),
-            ColumnDef::sys(StColumnFields::ColName.name(), AlgebraicType::String),
-            ColumnDef::sys(StColumnFields::ColType.name(), AlgebraicType::bytes()),
-        ],
-    )
-    .with_type(StTableType::System)
-    .with_column_constraint(Constraints::unique(), {
-        let mut cols = ColList::new(StColumnFields::TableId.col_id());
-        cols.push(StColumnFields::ColPos.col_id());
-        cols
-    })
-    .into_schema(ST_COLUMNS_ID)
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StColumnRow {
+    pub(crate) table_id: TableId,
+    pub(crate) col_pos: ColId,
+    pub(crate) col_name: Box<str>,
+    pub(crate) col_type: AlgebraicTypeViaBytes,
 }
 
-/// System Table [ST_INDEXES]
+impl TryFrom<RowRef<'_>> for StColumnRow {
+    type Error = DBError;
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
+    }
+}
+
+impl From<StColumnRow> for ProductValue {
+    fn from(x: StColumnRow) -> Self {
+        to_product_value(&x)
+    }
+}
+
+impl From<StColumnRow> for ColumnSchema {
+    fn from(column: StColumnRow) -> Self {
+        Self {
+            table_id: column.table_id,
+            col_pos: column.col_pos,
+            col_name: column.col_name,
+            col_type: column.col_type.0,
+        }
+    }
+}
+
+/// System Table [ST_INDEX_NAME]
 ///
-/// | index_id | table_id | index_name  | columns | is_unique | index_type |
-/// |----------|----------|-------------|---------|-----------|------------|
-/// | 1        |          | "ix_sample" | [1]     | false     | "btree"    |
-pub fn st_indexes_schema() -> TableSchema {
-    TableDef::new(
-        ST_INDEXES_NAME.into(),
-        vec![
-            ColumnDef::sys(StIndexFields::IndexId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StIndexFields::TableId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StIndexFields::IndexName.name(), AlgebraicType::String),
-            ColumnDef::sys(StIndexFields::Columns.name(), AlgebraicType::array(AlgebraicType::U32)),
-            ColumnDef::sys(StIndexFields::IsUnique.name(), AlgebraicType::Bool),
-            ColumnDef::sys(StIndexFields::IndexType.name(), AlgebraicType::U8),
-        ],
-    )
-    .with_type(StTableType::System)
-    // TODO: Unique constraint on index name?
-    .with_column_constraint(Constraints::primary_key_auto(), StIndexFields::IndexId.col_id())
-    .into_schema(ST_INDEXES_ID)
+/// | index_id | table_id | index_name  | index_algorithm            |
+/// |----------|----------|-------------|----------------------------|
+/// | 1        |          | "ix_sample" | btree({"columns": [1, 2]}) |
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StIndexRow {
+    pub(crate) index_id: IndexId,
+    pub(crate) table_id: TableId,
+    pub(crate) index_name: Box<str>,
+    pub(crate) index_algorithm: StIndexAlgorithm,
 }
 
-/// System Table [ST_SEQUENCES]
+/// An index algorithm for storing in the system tables.
+///
+/// It is critical that this type never grow in layout, as it is stored in the system tables.
+/// This is checked by (TODO(1.0): add a test!)
+///
+/// It is forbidden to add data to any of the variants of this type.
+/// You have to add a NEW variant.
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub enum StIndexAlgorithm {
+    /// Unused variant to reserve space.
+    Unused(u128),
+
+    /// A BTree index.
+    BTree { columns: ColList },
+}
+
+impl From<IndexAlgorithm> for StIndexAlgorithm {
+    fn from(algorithm: IndexAlgorithm) -> Self {
+        match algorithm {
+            IndexAlgorithm::BTree(BTreeAlgorithm { columns }) => StIndexAlgorithm::BTree { columns },
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl TryFrom<RowRef<'_>> for StIndexRow {
+    type Error = DBError;
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
+    }
+}
+
+impl From<StIndexRow> for ProductValue {
+    fn from(x: StIndexRow) -> Self {
+        to_product_value(&x)
+    }
+}
+
+impl From<StIndexRow> for IndexSchema {
+    fn from(x: StIndexRow) -> Self {
+        Self {
+            index_id: x.index_id,
+            table_id: x.table_id,
+            index_name: x.index_name,
+            index_algorithm: match x.index_algorithm {
+                StIndexAlgorithm::BTree { columns } => BTreeAlgorithm { columns }.into(),
+                StIndexAlgorithm::Unused(_) => panic!("Someone put a forbidden variant in the system table!"),
+            },
+        }
+    }
+}
+
+/// System Table [ST_SEQUENCE_NAME]
 ///
 /// | sequence_id | sequence_name     | increment | start | min_value | max_value | table_id | col_pos| allocated |
 /// |-------------|-------------------|-----------|-------|-----------|-----------|----------|--------|-----------|
 /// | 1           | "seq_customer_id" | 1         | 100   | 10        | 1200      | 1        | 1      | 200       |
-pub(crate) fn st_sequences_schema() -> TableSchema {
-    TableDef::new(
-        ST_SEQUENCES_NAME.into(),
-        vec![
-            ColumnDef::sys(StSequenceFields::SequenceId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StSequenceFields::SequenceName.name(), AlgebraicType::String),
-            ColumnDef::sys(StSequenceFields::TableId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StSequenceFields::ColPos.name(), AlgebraicType::U32),
-            ColumnDef::sys(StSequenceFields::Increment.name(), AlgebraicType::I128),
-            ColumnDef::sys(StSequenceFields::Start.name(), AlgebraicType::I128),
-            ColumnDef::sys(StSequenceFields::MinValue.name(), AlgebraicType::I128),
-            ColumnDef::sys(StSequenceFields::MaxValue.name(), AlgebraicType::I128),
-            ColumnDef::sys(StSequenceFields::Allocated.name(), AlgebraicType::I128),
-        ],
-    )
-    .with_type(StTableType::System)
-    // TODO: Unique constraint on sequence name?
-    .with_column_constraint(Constraints::primary_key_auto(), StSequenceFields::SequenceId.col_id())
-    .into_schema(ST_SEQUENCES_ID)
-}
-
-/// System Table [ST_CONSTRAINTS_NAME]
-///
-/// | constraint_id | constraint_name      | constraints | table_id | columns |
-/// |---------------|-------------------- -|-------------|-------|------------|
-/// | 1             | "unique_customer_id" | 1           | 100   | [1, 4]     |
-pub(crate) fn st_constraints_schema() -> TableSchema {
-    TableDef::new(
-        ST_CONSTRAINTS_NAME.into(),
-        vec![
-            ColumnDef::sys(StConstraintFields::ConstraintId.name(), AlgebraicType::U32),
-            ColumnDef::sys(StConstraintFields::ConstraintName.name(), AlgebraicType::String),
-            ColumnDef::sys(StConstraintFields::Constraints.name(), AlgebraicType::U8),
-            ColumnDef::sys(StConstraintFields::TableId.name(), AlgebraicType::U32),
-            ColumnDef::sys(
-                StConstraintFields::Columns.name(),
-                AlgebraicType::array(AlgebraicType::U32),
-            ),
-        ],
-    )
-    .with_type(StTableType::System)
-    .with_column_constraint(
-        Constraints::primary_key_auto(),
-        StConstraintFields::ConstraintId.col_id(),
-    )
-    .into_schema(ST_CONSTRAINTS_ID)
-}
-
-/// System table [ST_MODULE_NAME]
-///
-/// This table holds exactly one row, describing the latest version of the
-/// SpacetimeDB module associated with the database:
-///
-/// * `program_hash` is the [`Hash`] of the raw bytes of the (compiled) module.
-/// * `constraints` is the [`ModuleKind`] (currently always [`WASM_MODULE`]).
-/// * `epoch` is a _fencing token_ used to protect against concurrent updates.
-///
-/// | program_hash        | kind     | epoch |
-/// |---------------------|----------|-------|
-/// | [250, 207, 5, ...]  | 0        | 42    |
-pub(crate) fn st_module_schema() -> TableSchema {
-    TableDef::new(
-        ST_MODULE_NAME.into(),
-        vec![
-            ColumnDef::sys(
-                StModuleFields::ProgramHash.name(),
-                AlgebraicType::array(AlgebraicType::U8),
-            ),
-            ColumnDef::sys(StModuleFields::Kind.name(), AlgebraicType::U8),
-            ColumnDef::sys(StModuleFields::Epoch.name(), AlgebraicType::U128),
-        ],
-    )
-    .with_type(StTableType::System)
-    .into_schema(ST_MODULE_ID)
-}
-
-pub(crate) fn table_name_is_system(table_name: &str) -> bool {
-    table_name.starts_with("st_")
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct StTableRow<Name: AsRef<str>> {
-    pub(crate) table_id: TableId,
-    pub(crate) table_name: Name,
-    pub(crate) table_type: StTableType,
-    pub(crate) table_access: StAccess,
-}
-
-impl<'a> TryFrom<&'a ProductValue> for StTableRow<&'a str> {
-    type Error = DBError;
-    // TODO(cloutiertyler): Noa, can we just decorate `StTableRow` with Deserialize or something instead?
-    fn try_from(row: &'a ProductValue) -> Result<StTableRow<&'a str>, DBError> {
-        let table_id = row.field_as_u32(StTableFields::TableId.col_idx(), None)?.into();
-        let table_name = row.field_as_str(StTableFields::TableName.col_idx(), None)?;
-        let table_type = row
-            .field_as_str(StTableFields::TableType.col_idx(), None)?
-            .try_into()
-            .map_err(|x: &str| TableError::DecodeField {
-                table: ST_TABLES_NAME.into(),
-                field: StTableFields::TableType.col_name(),
-                expect: format!("`{}` or `{}`", StTableType::System.as_str(), StTableType::User.as_str()),
-                found: x.to_string(),
-            })?;
-
-        let table_access = row
-            .field_as_str(StTableFields::TablesAccess.col_idx(), None)?
-            .try_into()
-            .map_err(|x: &str| TableError::DecodeField {
-                table: ST_TABLES_NAME.into(),
-                field: StTableFields::TablesAccess.col_name(),
-                expect: format!("`{}` or `{}`", StAccess::Public.as_str(), StAccess::Private.as_str()),
-                found: x.to_string(),
-            })?;
-
-        Ok(StTableRow {
-            table_id,
-            table_name,
-            table_type,
-            table_access,
-        })
-    }
-}
-
-impl StTableRow<&str> {
-    pub fn to_owned(&self) -> StTableRow<String> {
-        StTableRow {
-            table_id: self.table_id,
-            table_name: self.table_name.to_owned(),
-            table_type: self.table_type,
-            table_access: self.table_access,
-        }
-    }
-}
-
-impl From<StTableRow<String>> for ProductValue {
-    fn from(x: StTableRow<String>) -> Self {
-        product![
-            x.table_id,
-            x.table_name,
-            x.table_type.as_str().to_owned(),
-            x.table_access.as_str().to_owned()
-        ]
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct StColumnRow<Name: AsRef<str>> {
-    pub(crate) table_id: TableId,
-    pub(crate) col_pos: ColId,
-    pub(crate) col_name: Name,
-    pub(crate) col_type: AlgebraicType,
-}
-
-impl StColumnRow<&str> {
-    pub fn to_owned(&self) -> StColumnRow<String> {
-        StColumnRow {
-            table_id: self.table_id,
-            col_pos: self.col_pos,
-            col_name: self.col_name.to_owned(),
-            col_type: self.col_type.clone(),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a ProductValue> for StColumnRow<&'a str> {
-    type Error = DBError;
-    fn try_from(row: &'a ProductValue) -> Result<StColumnRow<&'a str>, DBError> {
-        let table_id: TableId = row.field_as_u32(StColumnFields::TableId.col_idx(), None)?.into();
-        let col_pos = row.field_as_u32(StColumnFields::ColPos.col_idx(), None)?.into();
-        let col_name = row.field_as_str(StColumnFields::ColName.col_idx(), None)?;
-        let bytes = row.field_as_bytes(StColumnFields::ColType.col_idx(), None)?;
-        let col_type =
-            AlgebraicType::decode(&mut &bytes[..]).map_err(|e| TableError::InvalidSchema(table_id, e.into()))?;
-
-        Ok(StColumnRow {
-            table_id,
-            col_pos,
-            col_name,
-            col_type,
-        })
-    }
-}
-
-impl From<StColumnRow<String>> for ProductValue {
-    fn from(x: StColumnRow<String>) -> Self {
-        let mut bytes = Vec::new();
-        x.col_type.encode(&mut bytes);
-        product![x.table_id, x.col_pos, x.col_name, AlgebraicValue::Bytes(bytes)]
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct StIndexRow<Name: AsRef<str>> {
-    pub(crate) index_id: IndexId,
-    pub(crate) table_id: TableId,
-    pub(crate) index_name: Name,
-    pub(crate) columns: ColList,
-    pub(crate) is_unique: bool,
-    pub(crate) index_type: IndexType,
-}
-
-impl StIndexRow<&str> {
-    pub fn to_owned(&self) -> StIndexRow<String> {
-        StIndexRow {
-            index_id: self.index_id,
-            table_id: self.table_id,
-            columns: self.columns.clone(),
-            index_name: self.index_name.to_owned(),
-            is_unique: self.is_unique,
-            index_type: self.index_type,
-        }
-    }
-}
-
-fn to_cols(row: &ProductValue, col_pos: ColId, col_name: &'static str) -> Result<ColList, DBError> {
-    let index = col_pos.idx();
-    let name = Some(col_name);
-    let cols = row.field_as_array(index, name)?;
-    if let ArrayValue::U32(x) = &cols {
-        Ok(x.iter()
-            .map(|x| ColId::from(*x))
-            .collect::<ColListBuilder>()
-            .build()
-            .expect("empty ColList"))
-    } else {
-        Err(InvalidFieldError { name, col_pos }.into())
-    }
-}
-
-impl<'a> TryFrom<&'a ProductValue> for StIndexRow<&'a str> {
-    type Error = DBError;
-    fn try_from(row: &'a ProductValue) -> Result<StIndexRow<&'a str>, DBError> {
-        let index_id = row.field_as_u32(StIndexFields::IndexId.col_idx(), None)?.into();
-        let table_id = row.field_as_u32(StIndexFields::TableId.col_idx(), None)?.into();
-        let index_name = row.field_as_str(StIndexFields::IndexName.col_idx(), None)?;
-        let columns = to_cols(row, StIndexFields::Columns.col_id(), StIndexFields::Columns.name())?;
-        let is_unique = row.field_as_bool(StIndexFields::IsUnique.col_idx(), None)?;
-        let index_type = row.field_as_u8(StIndexFields::IndexType.col_idx(), None)?;
-        let index_type = IndexType::try_from(index_type).map_err(|_| InvalidFieldError {
-            col_pos: StIndexFields::IndexType.col_id(),
-            name: Some(StIndexFields::IndexType.name()),
-        })?;
-
-        Ok(StIndexRow {
-            index_id,
-            table_id,
-            index_name,
-            columns,
-            is_unique,
-            index_type,
-        })
-    }
-}
-
-impl From<StIndexRow<String>> for ProductValue {
-    fn from(x: StIndexRow<String>) -> Self {
-        product![
-            x.index_id,
-            x.table_id,
-            x.index_name,
-            ArrayValue::from(x.columns.to_u32_vec()),
-            x.is_unique,
-            u8::from(x.index_type),
-        ]
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct StSequenceRow<Name: AsRef<str>> {
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StSequenceRow {
     pub(crate) sequence_id: SequenceId,
-    pub(crate) sequence_name: Name,
+    pub(crate) sequence_name: Box<str>,
     pub(crate) table_id: TableId,
     pub(crate) col_pos: ColId,
     pub(crate) increment: i128,
@@ -499,66 +657,21 @@ pub struct StSequenceRow<Name: AsRef<str>> {
     pub(crate) allocated: i128,
 }
 
-impl<Name: AsRef<str>> StSequenceRow<Name> {
-    pub fn to_owned(&self) -> StSequenceRow<String> {
-        StSequenceRow {
-            sequence_id: self.sequence_id,
-            sequence_name: self.sequence_name.as_ref().to_owned(),
-            table_id: self.table_id,
-            col_pos: self.col_pos,
-            increment: self.increment,
-            start: self.start,
-            min_value: self.min_value,
-            max_value: self.max_value,
-            allocated: self.allocated,
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a ProductValue> for StSequenceRow<&'a str> {
+impl TryFrom<RowRef<'_>> for StSequenceRow {
     type Error = DBError;
-    fn try_from(row: &'a ProductValue) -> Result<StSequenceRow<&'a str>, DBError> {
-        let sequence_id = row.field_as_u32(StSequenceFields::SequenceId.col_idx(), None)?.into();
-        let sequence_name = row.field_as_str(StSequenceFields::SequenceName.col_idx(), None)?;
-        let table_id = row.field_as_u32(StSequenceFields::TableId.col_idx(), None)?.into();
-        let col_pos = row.field_as_u32(StSequenceFields::ColPos.col_idx(), None)?.into();
-        let increment = row.field_as_i128(StSequenceFields::Increment.col_idx(), None)?;
-        let start = row.field_as_i128(StSequenceFields::Start.col_idx(), None)?;
-        let min_value = row.field_as_i128(StSequenceFields::MinValue.col_idx(), None)?;
-        let max_value = row.field_as_i128(StSequenceFields::MaxValue.col_idx(), None)?;
-        let allocated = row.field_as_i128(StSequenceFields::Allocated.col_idx(), None)?;
-        Ok(StSequenceRow {
-            sequence_id,
-            sequence_name,
-            table_id,
-            col_pos,
-            increment,
-            start,
-            min_value,
-            max_value,
-            allocated,
-        })
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
     }
 }
 
-impl From<StSequenceRow<String>> for ProductValue {
-    fn from(x: StSequenceRow<String>) -> Self {
-        product![
-            x.sequence_id,
-            x.sequence_name,
-            x.table_id,
-            x.col_pos,
-            x.increment,
-            x.start,
-            x.min_value,
-            x.max_value,
-            x.allocated,
-        ]
+impl From<StSequenceRow> for ProductValue {
+    fn from(x: StSequenceRow) -> Self {
+        to_product_value(&x)
     }
 }
 
-impl From<StSequenceRow<String>> for SequenceSchema {
-    fn from(sequence: StSequenceRow<String>) -> Self {
+impl From<StSequenceRow> for SequenceSchema {
+    fn from(sequence: StSequenceRow) -> Self {
         Self {
             sequence_id: sequence.sequence_id,
             sequence_name: sequence.sequence_name,
@@ -573,66 +686,107 @@ impl From<StSequenceRow<String>> for SequenceSchema {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct StConstraintRow<Name: AsRef<str>> {
+/// System Table [ST_CONSTRAINT_NAME]
+///
+/// | constraint_id | constraint_name      | table_id    | constraint_data    -------------|
+/// |---------------|-------------------- -|-------------|---------------------------------|
+/// | 1             | "unique_customer_id" | 1           | unique({"columns": [1, 2]})     |
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StConstraintRow {
     pub(crate) constraint_id: ConstraintId,
-    pub(crate) constraint_name: Name,
-    pub(crate) constraints: Constraints,
+    pub(crate) constraint_name: Box<str>,
     pub(crate) table_id: TableId,
-    pub(crate) columns: ColList,
+    pub(crate) constraint_data: StConstraintData,
 }
 
-impl StConstraintRow<&str> {
-    pub fn to_owned(&self) -> StConstraintRow<String> {
-        StConstraintRow {
-            constraint_id: self.constraint_id,
-            constraint_name: self.constraint_name.to_string(),
-            constraints: self.constraints,
-            table_id: self.table_id,
-            columns: self.columns.clone(),
+/// Constraint data for storing in the system tables.
+///
+/// It is critical that this type never grow in layout, as it is stored in the system tables.
+/// This is checked by (TODO: add a check in this PR!)
+///
+/// It is forbidden to add data to any of the variants of this type.
+/// You have to add a NEW variant.
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub enum StConstraintData {
+    /// Unused variant to reserve space.
+    Unused(u128),
+
+    /// A BTree index.
+    Unique { columns: ColSet },
+}
+
+impl From<ConstraintData> for StConstraintData {
+    fn from(data: ConstraintData) -> Self {
+        match data {
+            ConstraintData::Unique(UniqueConstraintData { columns }) => StConstraintData::Unique { columns },
+            _ => unimplemented!(),
         }
     }
 }
 
-impl<'a> TryFrom<&'a ProductValue> for StConstraintRow<&'a str> {
+impl TryFrom<RowRef<'_>> for StConstraintRow {
     type Error = DBError;
-    fn try_from(row: &'a ProductValue) -> Result<StConstraintRow<&'a str>, DBError> {
-        let constraint_id = row
-            .field_as_u32(StConstraintFields::ConstraintId.col_idx(), None)?
-            .into();
-        let constraint_name = row.field_as_str(StConstraintFields::ConstraintName.col_idx(), None)?;
-        let constraints = row.field_as_u8(StConstraintFields::Constraints.col_idx(), None)?;
-        let constraints = Constraints::try_from(constraints).expect("Fail to decode Constraints");
-        let table_id = row.field_as_u32(StConstraintFields::TableId.col_idx(), None)?.into();
-        let columns = to_cols(
-            row,
-            StConstraintFields::Columns.col_id(),
-            StConstraintFields::Columns.name(),
-        )?;
-
-        Ok(StConstraintRow {
-            constraint_id,
-            constraint_name,
-            constraints,
-            table_id,
-            columns,
-        })
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
     }
 }
 
-impl From<StConstraintRow<String>> for ProductValue {
-    fn from(x: StConstraintRow<String>) -> Self {
-        product![
-            x.constraint_id,
-            x.constraint_name,
-            x.constraints.bits(),
-            x.table_id,
-            ArrayValue::from(x.columns.to_u32_vec())
-        ]
+impl From<StConstraintRow> for ProductValue {
+    fn from(x: StConstraintRow) -> Self {
+        to_product_value(&x)
     }
 }
 
-/// Indicates the kind of module the `program_hash` of a [`StModuleRow`]
+impl From<StConstraintRow> for ConstraintSchema {
+    fn from(x: StConstraintRow) -> Self {
+        Self {
+            constraint_id: x.constraint_id,
+            constraint_name: x.constraint_name,
+            table_id: x.table_id,
+            data: match x.constraint_data {
+                StConstraintData::Unique { columns } => ConstraintData::Unique(UniqueConstraintData { columns }),
+                StConstraintData::Unused(_) => panic!("Someone put a forbidden variant in the system table!"),
+            },
+        }
+    }
+}
+
+/// System Table [ST_ROW_LEVEL_SECURITY_NAME]
+///
+/// | table_id | sql          |
+/// |----------|--------------|
+/// | 1        | "SELECT ..." |
+#[derive(Debug, Clone, PartialEq, Eq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StRowLevelSecurityRow {
+    pub(crate) table_id: TableId,
+    pub(crate) sql: RawSql,
+}
+
+impl TryFrom<RowRef<'_>> for StRowLevelSecurityRow {
+    type Error = DBError;
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
+    }
+}
+
+impl From<StRowLevelSecurityRow> for ProductValue {
+    fn from(x: StRowLevelSecurityRow) -> Self {
+        to_product_value(&x)
+    }
+}
+
+impl From<StRowLevelSecurityRow> for RowLevelSecuritySchema {
+    fn from(x: StRowLevelSecurityRow) -> Self {
+        Self {
+            table_id: x.table_id,
+            sql: x.sql,
+        }
+    }
+}
+/// Indicates the kind of module the `program_bytes` of a [`StModuleRow`]
 /// describes.
 ///
 /// More or less a placeholder to allow for future non-WASM hosts without
@@ -647,70 +801,589 @@ pub const WASM_MODULE: ModuleKind = ModuleKind(0);
 
 impl_serialize!([] ModuleKind, (self, ser) => self.0.serialize(ser));
 impl_deserialize!([] ModuleKind, de => u8::deserialize(de).map(Self));
+impl_st!([] ModuleKind, AlgebraicType::U8);
 
-/// A monotonically increasing "epoch" value.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Epoch(pub(crate) u128);
-
-impl_serialize!([] Epoch, (self, ser) => self.0.serialize(ser));
-impl_deserialize!([] Epoch, de => u128::deserialize(de).map(Self));
-
-impl fmt::Display for Epoch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+/// A wrapper for `Address` that acts like `AlgebraicType::bytes()` for serialization purposes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddressViaU128(pub Address);
+impl_serialize!([] AddressViaU128, (self, ser) => self.0.to_u128().serialize(ser));
+impl_deserialize!([] AddressViaU128, de => <u128>::deserialize(de).map(Address::from_u128).map(AddressViaU128));
+impl_st!([] AddressViaU128, AlgebraicType::U128);
+impl From<Address> for AddressViaU128 {
+    fn from(addr: Address) -> Self {
+        Self(addr)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A wrapper for `Identity` that acts like `AlgebraicType::bytes()` for serialization purposes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityViaU256(pub Identity);
+impl_serialize!([] IdentityViaU256, (self, ser) => self.0.to_u256().serialize(ser));
+impl_deserialize!([] IdentityViaU256, de => <u256>::deserialize(de).map(Identity::from_u256).map(IdentityViaU256));
+impl_st!([] IdentityViaU256, AlgebraicType::U256);
+impl From<Identity> for IdentityViaU256 {
+    fn from(id: Identity) -> Self {
+        Self(id)
+    }
+}
+
+/// System table [ST_MODULE_NAME]
+/// This table holds exactly one row, describing the latest version of the
+/// SpacetimeDB module associated with the database:
+///
+/// * `database_identity` is the [`Identity`] of the database.
+/// * `owner_identity` is the [`Identity`] of the owner of the database.
+/// * `program_kind` is the [`ModuleKind`] (currently always [`WASM_MODULE`]).
+/// * `program_hash` is the [`Hash`] of the raw bytes of the (compiled) module.
+/// * `program_bytes` are the raw bytes of the (compiled) module.
+/// * `module_version` is the version of the module.
+///
+/// | identity | owner_identity |  program_kind | program_bytes | program_hash        | module_version |
+/// |------------------|----------------|---------------|---------------|---------------------|----------------|
+/// | <bytes>          | <bytes>        |  0            | <bytes>       | <bytes>             | <string>       |
+#[derive(Clone, Debug, Eq, PartialEq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
 pub struct StModuleRow {
+    pub(crate) database_identity: IdentityViaU256,
+    pub(crate) owner_identity: IdentityViaU256,
+    pub(crate) program_kind: ModuleKind,
     pub(crate) program_hash: Hash,
-    pub(crate) kind: ModuleKind,
-    pub(crate) epoch: Epoch,
+    pub(crate) program_bytes: Box<[u8]>,
+    pub(crate) module_version: Box<str>,
 }
 
-impl StModuleRow {
-    pub fn to_owned(&self) -> StModuleRow {
-        self.clone()
+/// Read bytes directly from the column `col` in `row`.
+pub fn read_bytes_from_col(row: RowRef<'_>, col: impl StFields) -> Result<Box<[u8]>, DBError> {
+    let bytes = row.read_col::<ArrayValue>(col.col_id())?;
+    if let ArrayValue::U8(bytes) = bytes {
+        Ok(bytes)
+    } else {
+        Err(InvalidFieldError {
+            name: Some(col.name()),
+            col_pos: col.col_id(),
+        }
+        .into())
     }
 }
 
-impl TryFrom<&ProductValue> for StModuleRow {
+/// Read an [`Address`] directly from the column `col` in `row`.
+///
+/// The [`Address`] is assumed to be stored as an u128.
+pub fn read_addr_from_col(row: RowRef<'_>, col: impl StFields) -> Result<Identity, DBError> {
+    let val: u256 = row.read_col(col.col_id())?;
+    Ok(Identity::from_u256(val))
+}
+
+/// Read an [`Identity`] directly from the column `col` in `row`.
+///
+/// The [`Identity`] is assumed to be stored as a flat byte array.
+pub fn read_identity_from_col(row: RowRef<'_>, col: impl StFields) -> Result<Identity, DBError> {
+    Ok(Identity::from_u256(row.read_col(col.col_id())?))
+}
+
+/// Read a [`Hash`] directly from the column `col` in `row`.
+///
+/// The [`Hash`] is assumed to be stored as a flat byte array.
+pub fn read_hash_from_col(row: RowRef<'_>, col: impl StFields) -> Result<Hash, DBError> {
+    Ok(Hash::from_u256(row.read_col(col.col_id())?))
+}
+
+impl TryFrom<RowRef<'_>> for StModuleRow {
     type Error = DBError;
 
-    fn try_from(row: &ProductValue) -> Result<Self, Self::Error> {
-        let program_hash = row
-            .field_as_bytes(
-                StModuleFields::ProgramHash.col_idx(),
-                Some(StModuleFields::ProgramHash.name()),
-            )
-            .map(Hash::from_slice)?;
-        let kind = row
-            .field_as_u8(StModuleFields::Kind.col_idx(), Some(StModuleFields::Kind.name()))
-            .map(ModuleKind)?;
-        let epoch = row
-            .field_as_u128(StModuleFields::Epoch.col_idx(), Some(StModuleFields::Epoch.name()))
-            .map(Epoch)?;
+    fn try_from(row: RowRef<'_>) -> Result<Self, Self::Error> {
+        read_via_bsatn(row)
+    }
+}
 
-        Ok(Self {
-            program_hash,
-            kind,
-            epoch,
+impl From<StModuleRow> for ProductValue {
+    fn from(row: StModuleRow) -> Self {
+        to_product_value(&row)
+    }
+}
+
+/// System table [ST_CLIENT_NAME]
+///
+/// identity                                                                                | address
+/// -----------------------------------------------------------------------------------------+--------------------------------------------------------
+///  (__identity_bytes = 0x7452047061ea2502003412941d85a42f89b0702588b823ab55fc4f12e9ea8363) | (__address_bytes = 0x6bdea3ab517f5857dc9b1b5fe99e1b14)
+#[derive(Clone, Debug, Eq, PartialEq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StClientRow {
+    pub(crate) identity: IdentityViaU256,
+    pub(crate) address: AddressViaU128,
+}
+
+impl From<StClientRow> for ProductValue {
+    fn from(var: StClientRow) -> Self {
+        to_product_value(&var)
+    }
+}
+impl From<&StClientRow> for ProductValue {
+    fn from(var: &StClientRow) -> Self {
+        to_product_value(var)
+    }
+}
+
+impl TryFrom<RowRef<'_>> for StClientRow {
+    type Error = DBError;
+
+    fn try_from(row: RowRef<'_>) -> Result<Self, Self::Error> {
+        read_via_bsatn(row)
+    }
+}
+
+/// A handle for reading system variables from `st_var`
+pub struct StVarTable;
+
+impl StVarTable {
+    /// Read the value of [ST_VARNAME_ROW_LIMIT] from `st_var`
+    pub fn row_limit(ctx: &ExecutionContext, db: &RelationalDB, tx: &TxId) -> Result<Option<u64>, DBError> {
+        let data = Self::read_var(ctx, db, tx, StVarName::RowLimit);
+
+        if let Some(StVarValue::U64(limit)) = data? {
+            return Ok(Some(limit));
+        }
+        Ok(None)
+    }
+
+    /// Read the value of [ST_VARNAME_SLOW_QRY] from `st_var`
+    pub fn query_limit(ctx: &ExecutionContext, db: &RelationalDB, tx: &TxId) -> Result<Option<u64>, DBError> {
+        if let Some(StVarValue::U64(ms)) = Self::read_var(ctx, db, tx, StVarName::SlowQryThreshold)? {
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    /// Read the value of [ST_VARNAME_SLOW_SUB] from `st_var`
+    pub fn sub_limit(ctx: &ExecutionContext, db: &RelationalDB, tx: &TxId) -> Result<Option<u64>, DBError> {
+        if let Some(StVarValue::U64(ms)) = Self::read_var(ctx, db, tx, StVarName::SlowSubThreshold)? {
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    /// Read the value of [ST_VARNAME_SLOW_INC] from `st_var`
+    pub fn incr_limit(ctx: &ExecutionContext, db: &RelationalDB, tx: &TxId) -> Result<Option<u64>, DBError> {
+        if let Some(StVarValue::U64(ms)) = Self::read_var(ctx, db, tx, StVarName::SlowIncThreshold)? {
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    /// Read the value of a system variable from `st_var`
+    pub fn read_var(
+        ctx: &ExecutionContext,
+        db: &RelationalDB,
+        tx: &TxId,
+        name: StVarName,
+    ) -> Result<Option<StVarValue>, DBError> {
+        if let Some(row_ref) = db
+            .iter_by_col_eq(ctx, tx, ST_VAR_ID, StVarFields::Name.col_id(), &name.into())?
+            .next()
+        {
+            return Ok(Some(StVarRow::try_from(row_ref)?.value));
+        }
+        Ok(None)
+    }
+
+    /// Update the value of a system variable in `st_var`
+    pub fn write_var(
+        ctx: &ExecutionContext,
+        db: &RelationalDB,
+        tx: &mut MutTxId,
+        name: StVarName,
+        literal: &str,
+    ) -> Result<(), DBError> {
+        let value = Self::parse_var(name, literal)?;
+        if let Some(row_ref) = db
+            .iter_by_col_eq_mut(ctx, tx, ST_VAR_ID, StVarFields::Name.col_id(), &name.into())?
+            .next()
+        {
+            db.delete(tx, ST_VAR_ID, [row_ref.pointer()]);
+        }
+        let row = value_serialize(&StVarRow { name, value });
+        db.insert(tx, ST_VAR_ID, row.into_product().expect("should be product"))?;
+        Ok(())
+    }
+
+    /// Parse the literal representation of a system variable
+    fn parse_var(name: StVarName, literal: &str) -> Result<StVarValue, DBError> {
+        StVarValue::try_from_primitive(parse::parse(literal, &name.type_of())?).map_err(|v| {
+            ErrorVm::Type(ErrorType::Parse {
+                value: literal.to_string(),
+                ty: fmt_algebraic_type(&name.type_of()).to_string(),
+                err: format!("error parsing value: {:?}", v),
+            })
+            .into()
         })
     }
 }
 
-impl From<&StModuleRow> for ProductValue {
-    fn from(
-        StModuleRow {
-            program_hash,
-            kind: ModuleKind(kind),
-            epoch: Epoch(epoch),
-        }: &StModuleRow,
-    ) -> Self {
-        product![
-            AlgebraicValue::Bytes(program_hash.as_slice().to_owned()),
-            AlgebraicValue::U8(*kind),
-            AlgebraicValue::U128(*epoch),
-        ]
+/// System table [ST_VAR_NAME]
+///
+/// | name        | value     |
+/// |-------------|-----------|
+/// | "row_limit" | (U64 = 5) |
+#[derive(Debug, Clone, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StVarRow {
+    pub name: StVarName,
+    pub value: StVarValue,
+}
+
+impl From<StVarRow> for ProductValue {
+    fn from(var: StVarRow) -> Self {
+        to_product_value(&var)
+    }
+}
+
+impl From<StVarRow> for AlgebraicValue {
+    fn from(row: StVarRow) -> Self {
+        AlgebraicValue::Product(row.into())
+    }
+}
+
+/// A system variable that defines a row limit for queries and subscriptions.
+/// If the cardinality of a query is estimated to exceed this limit,
+/// it will be rejected before being executed.
+pub const ST_VARNAME_ROW_LIMIT: &str = "row_limit";
+/// A system variable that defines a threshold for logging slow queries.
+pub const ST_VARNAME_SLOW_QRY: &str = "slow_ad_hoc_query_ms";
+/// A system variable that defines a threshold for logging slow subscriptions.
+pub const ST_VARNAME_SLOW_SUB: &str = "slow_subscription_query_ms";
+/// A system variable that defines a threshold for logging slow tx updates.
+pub const ST_VARNAME_SLOW_INC: &str = "slow_tx_update_ms";
+
+/// The name of a system variable in `st_var`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StVarName {
+    RowLimit,
+    SlowQryThreshold,
+    SlowSubThreshold,
+    SlowIncThreshold,
+}
+impl From<StVarName> for &'static str {
+    fn from(value: StVarName) -> Self {
+        match value {
+            StVarName::RowLimit => ST_VARNAME_ROW_LIMIT,
+            StVarName::SlowQryThreshold => ST_VARNAME_SLOW_QRY,
+            StVarName::SlowSubThreshold => ST_VARNAME_SLOW_SUB,
+            StVarName::SlowIncThreshold => ST_VARNAME_SLOW_INC,
+        }
+    }
+}
+impl From<StVarName> for AlgebraicValue {
+    fn from(value: StVarName) -> Self {
+        let value: &'static str = value.into();
+        AlgebraicValue::String(value.into())
+    }
+}
+impl FromStr for StVarName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            ST_VARNAME_ROW_LIMIT => Ok(StVarName::RowLimit),
+            ST_VARNAME_SLOW_QRY => Ok(StVarName::SlowQryThreshold),
+            ST_VARNAME_SLOW_SUB => Ok(StVarName::SlowSubThreshold),
+            ST_VARNAME_SLOW_INC => Ok(StVarName::SlowIncThreshold),
+            _ => Err(anyhow::anyhow!("Invalid system variable {}", s)),
+        }
+    }
+}
+impl_st!([] StVarName, AlgebraicType::String);
+impl_serialize!([] StVarName, (self, ser) => <&'static str>::from(*self).serialize(ser));
+impl<'de> Deserialize<'de> for StVarName {
+    fn deserialize<D: spacetimedb_lib::de::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = <&str>::deserialize(de)?;
+        s.parse().map_err(D::Error::custom)
+    }
+}
+
+impl StVarName {
+    pub fn type_of(&self) -> AlgebraicType {
+        match self {
+            StVarName::RowLimit
+            | StVarName::SlowQryThreshold
+            | StVarName::SlowSubThreshold
+            | StVarName::SlowIncThreshold => AlgebraicType::U64,
+        }
+    }
+}
+
+/// The value of a system variable in `st_var`
+#[derive(Debug, Clone, From, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub enum StVarValue {
+    Bool(bool),
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    I128(i128),
+    U128(u128),
+    // No support for u/i256 added here as it seems unlikely to be useful.
+    F32(f32),
+    F64(f64),
+    String(Box<str>),
+}
+
+impl StVarValue {
+    pub fn try_from_primitive(value: AlgebraicValue) -> Result<Self, AlgebraicValue> {
+        match value {
+            AlgebraicValue::Bool(v) => Ok(StVarValue::Bool(v)),
+            AlgebraicValue::I8(v) => Ok(StVarValue::I8(v)),
+            AlgebraicValue::U8(v) => Ok(StVarValue::U8(v)),
+            AlgebraicValue::I16(v) => Ok(StVarValue::I16(v)),
+            AlgebraicValue::U16(v) => Ok(StVarValue::U16(v)),
+            AlgebraicValue::I32(v) => Ok(StVarValue::I32(v)),
+            AlgebraicValue::U32(v) => Ok(StVarValue::U32(v)),
+            AlgebraicValue::I64(v) => Ok(StVarValue::I64(v)),
+            AlgebraicValue::U64(v) => Ok(StVarValue::U64(v)),
+            AlgebraicValue::I128(v) => Ok(StVarValue::I128(v.0)),
+            AlgebraicValue::U128(v) => Ok(StVarValue::U128(v.0)),
+            AlgebraicValue::F32(v) => Ok(StVarValue::F32(v.into_inner())),
+            AlgebraicValue::F64(v) => Ok(StVarValue::F64(v.into_inner())),
+            AlgebraicValue::String(v) => Ok(StVarValue::String(v)),
+            _ => Err(value),
+        }
+    }
+
+    pub fn try_from_sum(value: AlgebraicValue) -> Result<Self, AlgebraicValue> {
+        value.into_sum()?.try_into()
+    }
+}
+
+impl TryFrom<SumValue> for StVarValue {
+    type Error = AlgebraicValue;
+
+    fn try_from(sum: SumValue) -> Result<Self, Self::Error> {
+        match sum.tag {
+            0 => Ok(StVarValue::Bool(sum.value.into_bool()?)),
+            1 => Ok(StVarValue::I8(sum.value.into_i8()?)),
+            2 => Ok(StVarValue::U8(sum.value.into_u8()?)),
+            3 => Ok(StVarValue::I16(sum.value.into_i16()?)),
+            4 => Ok(StVarValue::U16(sum.value.into_u16()?)),
+            5 => Ok(StVarValue::I32(sum.value.into_i32()?)),
+            6 => Ok(StVarValue::U32(sum.value.into_u32()?)),
+            7 => Ok(StVarValue::I64(sum.value.into_i64()?)),
+            8 => Ok(StVarValue::U64(sum.value.into_u64()?)),
+            9 => Ok(StVarValue::I128(sum.value.into_i128()?.0)),
+            10 => Ok(StVarValue::U128(sum.value.into_u128()?.0)),
+            11 => Ok(StVarValue::F32(sum.value.into_f32()?.into_inner())),
+            12 => Ok(StVarValue::F64(sum.value.into_f64()?.into_inner())),
+            13 => Ok(StVarValue::String(sum.value.into_string()?)),
+            _ => Err(*sum.value),
+        }
+    }
+}
+
+impl From<StVarValue> for AlgebraicValue {
+    fn from(value: StVarValue) -> Self {
+        AlgebraicValue::Sum(value.into())
+    }
+}
+
+impl From<StVarValue> for SumValue {
+    fn from(value: StVarValue) -> Self {
+        match value {
+            StVarValue::Bool(v) => SumValue {
+                tag: 0,
+                value: Box::new(AlgebraicValue::Bool(v)),
+            },
+            StVarValue::I8(v) => SumValue {
+                tag: 1,
+                value: Box::new(AlgebraicValue::I8(v)),
+            },
+            StVarValue::U8(v) => SumValue {
+                tag: 2,
+                value: Box::new(AlgebraicValue::U8(v)),
+            },
+            StVarValue::I16(v) => SumValue {
+                tag: 3,
+                value: Box::new(AlgebraicValue::I16(v)),
+            },
+            StVarValue::U16(v) => SumValue {
+                tag: 4,
+                value: Box::new(AlgebraicValue::U16(v)),
+            },
+            StVarValue::I32(v) => SumValue {
+                tag: 5,
+                value: Box::new(AlgebraicValue::I32(v)),
+            },
+            StVarValue::U32(v) => SumValue {
+                tag: 6,
+                value: Box::new(AlgebraicValue::U32(v)),
+            },
+            StVarValue::I64(v) => SumValue {
+                tag: 7,
+                value: Box::new(AlgebraicValue::I64(v)),
+            },
+            StVarValue::U64(v) => SumValue {
+                tag: 8,
+                value: Box::new(AlgebraicValue::U64(v)),
+            },
+            StVarValue::I128(v) => SumValue {
+                tag: 9,
+                value: Box::new(AlgebraicValue::I128(v.into())),
+            },
+            StVarValue::U128(v) => SumValue {
+                tag: 10,
+                value: Box::new(AlgebraicValue::U128(v.into())),
+            },
+            StVarValue::F32(v) => SumValue {
+                tag: 11,
+                value: Box::new(AlgebraicValue::F32(v.into())),
+            },
+            StVarValue::F64(v) => SumValue {
+                tag: 12,
+                value: Box::new(AlgebraicValue::F64(v.into())),
+            },
+            StVarValue::String(v) => SumValue {
+                tag: 13,
+                value: Box::new(AlgebraicValue::String(v)),
+            },
+        }
+    }
+}
+
+impl TryFrom<RowRef<'_>> for StVarRow {
+    type Error = DBError;
+
+    fn try_from(row: RowRef<'_>) -> Result<Self, Self::Error> {
+        // The position of the `value` column in `st_var`
+        let col_pos = StVarFields::Value.col_id();
+
+        // An error when reading the `value` column in `st_var`
+        let invalid_value = InvalidFieldError {
+            col_pos,
+            name: Some(StVarFields::Value.name()),
+        };
+
+        let name = row.read_col::<Box<str>>(StVarFields::Name.col_id())?;
+        let name = StVarName::from_str(&name)?;
+        match row.read_col::<AlgebraicValue>(col_pos)? {
+            AlgebraicValue::Sum(sum) => Ok(StVarRow {
+                name,
+                value: sum.try_into().map_err(|_| invalid_value)?,
+            }),
+            _ => Err(invalid_value.into()),
+        }
+    }
+}
+
+/// System table [ST_SCHEDULED_NAME]
+/// | schedule_id | table_id | reducer_name | schedule_name |
+#[derive(Clone, Debug, Eq, PartialEq, SpacetimeType)]
+#[sats(crate = spacetimedb_lib)]
+pub struct StScheduledRow {
+    pub(crate) schedule_id: ScheduleId,
+    pub(crate) table_id: TableId,
+    pub(crate) reducer_name: Box<str>,
+    pub(crate) schedule_name: Box<str>,
+    pub(crate) at_column: ColId,
+}
+
+impl TryFrom<RowRef<'_>> for StScheduledRow {
+    type Error = DBError;
+    fn try_from(row: RowRef<'_>) -> Result<Self, DBError> {
+        read_via_bsatn(row)
+    }
+}
+
+impl From<StScheduledRow> for ProductValue {
+    fn from(x: StScheduledRow) -> Self {
+        to_product_value(&x)
+    }
+}
+
+impl From<StScheduledRow> for ScheduleSchema {
+    fn from(row: StScheduledRow) -> Self {
+        Self {
+            table_id: row.table_id,
+            reducer_name: row.reducer_name,
+            schedule_id: row.schedule_id,
+            schedule_name: row.schedule_name,
+            at_column: row.at_column,
+        }
+    }
+}
+
+thread_local! {
+    static READ_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Read a value from a system table via BSatn.
+fn read_via_bsatn<T: DeserializeOwned>(row: RowRef<'_>) -> Result<T, DBError> {
+    READ_BUF.with_borrow_mut(|buf| Ok(row.read_via_bsatn::<T>(buf)?))
+}
+
+/// Convert a value to a product value.
+/// Panics if the value does not serialize to a product value.
+/// It's fine to call this on system table types, because `validate_system_table` checks that
+/// they are `ProductType`s.
+///
+/// TODO: this performs some unnecessary allocation. We may want to reimplement the conversions manually for
+/// performance eventually.
+fn to_product_value<T: Serialize>(value: &T) -> ProductValue {
+    value_serialize(&value).into_product().expect("should be product")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::relational_db::tests_utils::TestDB;
+
+    use super::*;
+
+    #[test]
+    fn test_system_variables() {
+        let db = TestDB::durable().expect("failed to create db");
+        let ctx = ExecutionContext::default();
+        let _ = db.with_auto_commit(&ctx, |tx| {
+            StVarTable::write_var(&ctx, &db, tx, StVarName::RowLimit, "5")
+        });
+        assert_eq!(
+            5,
+            db.with_read_only(&ctx, |tx| StVarTable::row_limit(&ctx, &db, tx))
+                .expect("failed to read from st_var")
+                .expect("row_limit does not exist")
+        );
+    }
+
+    #[test]
+    fn test_sequences_within_reserved_range() {
+        let mut num_tables = 0;
+        let mut num_indexes = 0;
+        let mut num_constraints = 0;
+        let mut num_sequences = 0;
+
+        for table in system_tables() {
+            num_tables += 1;
+            num_indexes += table.indexes.len();
+            num_constraints += table.constraints.len();
+            num_sequences += table.sequences.len();
+        }
+
+        assert!(
+            num_tables <= ST_RESERVED_SEQUENCE_RANGE,
+            "number of system tables exceeds reserved sequence range"
+        );
+        assert!(
+            num_indexes <= ST_RESERVED_SEQUENCE_RANGE as usize,
+            "number of system indexes exceeds reserved sequence range"
+        );
+        assert!(
+            num_constraints <= ST_RESERVED_SEQUENCE_RANGE as usize,
+            "number of system constraints exceeds reserved sequence range"
+        );
+        assert!(
+            num_sequences <= ST_RESERVED_SEQUENCE_RANGE as usize,
+            "number of system sequences exceeds reserved sequence range"
+        );
     }
 }

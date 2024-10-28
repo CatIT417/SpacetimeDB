@@ -1,29 +1,34 @@
 use std::path::Path;
 
-use spacetimedb::db::{Config, FsyncPolicy, Storage};
+use spacetimedb::db::{Config, Storage};
 use spacetimedb_lib::{
     sats::{product, ArrayValue},
-    AlgebraicValue, ProductValue,
+    AlgebraicValue,
 };
+use spacetimedb_primitives::ColId;
 use spacetimedb_testing::modules::{start_runtime, CompilationMode, CompiledModule, LoggerRecord, ModuleHandle};
 use tokio::runtime::Runtime;
 
 use crate::{
     database::BenchDatabase,
-    schemas::{snake_case_table_name, table_name, BenchTable},
+    schemas::{table_name, BenchTable},
     ResultBench,
 };
 
 lazy_static::lazy_static! {
     pub static ref BENCHMARKS_MODULE: CompiledModule = {
-        // Temporarily add CARGO_TARGET_DIR override to avoid conflicts with main target dir.
-        // Otherwise for some reason Cargo will mark all dependencies with build scripts as
-        // fresh - but only if running benchmarks (if modules are built in release mode).
-        // See https://github.com/clockworklabs/SpacetimeDB/issues/401.
-        std::env::set_var("CARGO_TARGET_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
-        let module = CompiledModule::compile("benchmarks", CompilationMode::Release);
-        std::env::remove_var("CARGO_TARGET_DIR");
-        module
+        if std::env::var_os("STDB_BENCH_CS").is_some() {
+            CompiledModule::compile("benchmarks-cs", CompilationMode::Release)
+        } else {
+            // Temporarily add CARGO_TARGET_DIR override to avoid conflicts with main target dir.
+            // Otherwise for some reason Cargo will mark all dependencies with build scripts as
+            // fresh - but only if running benchmarks (if modules are built in release mode).
+            // See https://github.com/clockworklabs/SpacetimeDB/issues/401.
+            std::env::set_var("CARGO_TARGET_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
+            let module = CompiledModule::compile("benchmarks", CompilationMode::Release);
+            std::env::remove_var("CARGO_TARGET_DIR");
+            module
+        }
     };
 }
 
@@ -60,17 +65,12 @@ impl BenchDatabase for SpacetimeModule {
 
     type TableId = TableId;
 
-    fn build(in_memory: bool, fsync: bool) -> ResultBench<Self>
+    fn build(in_memory: bool, _fsync: bool) -> ResultBench<Self>
     where
         Self: Sized,
     {
         let runtime = start_runtime();
         let config = Config {
-            fsync: if fsync {
-                FsyncPolicy::EveryTx
-            } else {
-                FsyncPolicy::Never
-            },
             storage: if in_memory { Storage::Memory } else { Storage::Disk },
         };
 
@@ -82,8 +82,11 @@ impl BenchDatabase for SpacetimeModule {
                 .await
         });
 
-        for thing in module.client.module.catalog().iter() {
-            log::trace!("SPACETIME_MODULE: LOADED: {} {:?}", thing.0, thing.1.ty());
+        for table in module.client.module.info.module_def.tables() {
+            log::trace!("SPACETIME_MODULE: LOADED TABLE: {:?}", table);
+        }
+        for reducer in module.client.module.info.module_def.reducers() {
+            log::trace!("SPACETIME_MODULE: LOADED REDUCER: {:?}", reducer);
         }
         Ok(SpacetimeModule {
             runtime,
@@ -98,7 +101,7 @@ impl BenchDatabase for SpacetimeModule {
         // Noop. All tables are built into the "benchmarks" module.
         Ok(TableId {
             pascal_case: table_name::<T>(table_style),
-            snake_case: snake_case_table_name::<T>(table_style),
+            snake_case: table_name::<T>(table_style),
         })
     }
 
@@ -112,7 +115,7 @@ impl BenchDatabase for SpacetimeModule {
             module.call_reducer_binary(&name, ProductValue::new(&[])).await?;
             */
             // workaround for now
-            module.client.module.clear_table(table_id.pascal_case.clone()).await?;
+            module.client.module.clear_table(&table_id.pascal_case)?;
             Ok(())
         })
     }
@@ -126,7 +129,7 @@ impl BenchDatabase for SpacetimeModule {
 
         let count = runtime.block_on(async move {
             let name = format!("count_{}", table_id.snake_case);
-            module.call_reducer_binary(&name, ProductValue::new(&[])).await?;
+            module.call_reducer_binary(&name, [].into()).await?;
             let logs = module.read_log(Some(1)).await;
             let message = serde_json::from_str::<LoggerRecord>(&logs)?;
             if !message.message.starts_with("COUNT: ") {
@@ -144,20 +147,7 @@ impl BenchDatabase for SpacetimeModule {
         let module = module.as_mut().unwrap();
 
         runtime.block_on(async move {
-            module.call_reducer_binary("empty", ProductValue::new(&[])).await?;
-            Ok(())
-        })
-    }
-
-    fn insert<T: BenchTable>(&mut self, table_id: &Self::TableId, row: T) -> ResultBench<()> {
-        let SpacetimeModule { runtime, module } = self;
-        let module = module.as_mut().unwrap();
-        let reducer_name = format!("insert_{}", table_id.snake_case);
-
-        runtime.block_on(async move {
-            module
-                .call_reducer_binary(&reducer_name, row.into_product_value())
-                .await?;
+            module.call_reducer_binary("empty", [].into()).await?;
             Ok(())
         })
     }
@@ -193,9 +183,7 @@ impl BenchDatabase for SpacetimeModule {
         let reducer_name = format!("iterate_{}", table_id.snake_case);
 
         runtime.block_on(async move {
-            module
-                .call_reducer_binary(&reducer_name, ProductValue::new(&[]))
-                .await?;
+            module.call_reducer_binary(&reducer_name, [].into()).await?;
             Ok(())
         })
     }
@@ -203,20 +191,18 @@ impl BenchDatabase for SpacetimeModule {
     fn filter<T: BenchTable>(
         &mut self,
         table_id: &Self::TableId,
-        column_index: u32,
+        col_id: impl Into<ColId>,
         value: AlgebraicValue,
     ) -> ResultBench<()> {
         let SpacetimeModule { runtime, module } = self;
         let module = module.as_mut().unwrap();
 
         let product_type = T::product_type();
-        let column_name = product_type.elements[column_index as usize].name.as_ref().unwrap();
+        let column_name = product_type.elements[col_id.into().idx()].name.as_ref().unwrap();
         let reducer_name = format!("filter_{}_by_{}", table_id.snake_case, column_name);
 
         runtime.block_on(async move {
-            module
-                .call_reducer_binary(&reducer_name, ProductValue { elements: vec![value] })
-                .await?;
+            module.call_reducer_binary(&reducer_name, [value].into()).await?;
             Ok(())
         })
     }

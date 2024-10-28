@@ -3,19 +3,21 @@ use crate::{
     schemas::{table_name, BenchTable, IndexStrategy},
     ResultBench,
 };
-use spacetimedb::db::relational_db::{open_db, RelationalDB};
+use spacetimedb::db::relational_db::{tests_utils::TestDB, RelationalDB};
 use spacetimedb::execution_context::ExecutionContext;
 use spacetimedb_lib::sats::AlgebraicValue;
-use spacetimedb_primitives::{ColId, TableId};
-use spacetimedb_sats::db::def::{IndexDef, TableDef};
+use spacetimedb_primitives::{ColId, IndexId, TableId};
+use spacetimedb_schema::{
+    def::{BTreeAlgorithm, IndexAlgorithm},
+    schema::{IndexSchema, TableSchema},
+};
 use std::hint::black_box;
 use tempdir::TempDir;
 
 pub type DbResult = (RelationalDB, TempDir, u32);
 
 pub struct SpacetimeRaw {
-    db: RelationalDB,
-    _temp_dir: TempDir,
+    pub db: TestDB,
 }
 
 impl BenchDatabase for SpacetimeRaw {
@@ -24,37 +26,54 @@ impl BenchDatabase for SpacetimeRaw {
     }
     type TableId = TableId;
 
-    fn build(in_memory: bool, fsync: bool) -> ResultBench<Self>
+    fn build(in_memory: bool, _fsync: bool) -> ResultBench<Self>
     where
         Self: Sized,
     {
-        let temp_dir = TempDir::new("stdb_test")?;
-        let db = open_db(temp_dir.path(), in_memory, fsync)?;
-
-        Ok(SpacetimeRaw {
-            db,
-            _temp_dir: temp_dir,
-        })
+        let db = if in_memory {
+            TestDB::in_memory()
+        } else {
+            TestDB::durable()
+        }?;
+        Ok(Self { db })
     }
 
     fn create_table<T: BenchTable>(&mut self, index_strategy: IndexStrategy) -> ResultBench<Self::TableId> {
         let name = table_name::<T>(index_strategy);
         self.db.with_auto_commit(&ExecutionContext::default(), |tx| {
-            let table_def = TableDef::from_product(&name, T::product_type());
-            let table_id = self.db.create_table(tx, table_def)?;
+            let mut table_schema = TableSchema::from_product_type(T::product_type());
+            table_schema.table_name = name.clone().into();
+            let table_id = self.db.create_table(tx, table_schema)?;
             self.db.rename_table(tx, table_id, &name)?;
             match index_strategy {
-                IndexStrategy::Unique => {
-                    self.db
-                        .create_index(tx, table_id, IndexDef::btree("id".into(), ColId(0), true))?;
+                IndexStrategy::Unique0 => {
+                    self.db.create_index(
+                        tx,
+                        IndexSchema {
+                            index_id: IndexId::SENTINEL,
+                            table_id,
+                            index_name: "id".into(),
+                            index_algorithm: IndexAlgorithm::BTree(BTreeAlgorithm {
+                                columns: ColId(0).into(),
+                            }),
+                        },
+                        true,
+                    )?;
                 }
-                IndexStrategy::NonUnique => (),
-                IndexStrategy::MultiIndex => {
+                IndexStrategy::NoIndex => (),
+                IndexStrategy::BTreeEachColumn => {
                     for (i, column) in T::product_type().elements.iter().enumerate() {
                         self.db.create_index(
                             tx,
-                            table_id,
-                            IndexDef::btree(column.name.clone().unwrap(), ColId(i as u32), false),
+                            IndexSchema {
+                                index_id: IndexId::SENTINEL,
+                                table_id,
+                                index_name: column.name.clone().unwrap(),
+                                index_algorithm: IndexAlgorithm::BTree(BTreeAlgorithm {
+                                    columns: ColId(i as _).into(),
+                                }),
+                            },
+                            false,
                         )?;
                     }
                 }
@@ -80,13 +99,6 @@ impl BenchDatabase for SpacetimeRaw {
 
     fn empty_transaction(&mut self) -> ResultBench<()> {
         self.db.with_auto_commit(&ExecutionContext::default(), |_tx| Ok(()))
-    }
-
-    fn insert<T: BenchTable>(&mut self, table_id: &Self::TableId, row: T) -> ResultBench<()> {
-        self.db.with_auto_commit(&ExecutionContext::default(), |tx| {
-            self.db.insert(tx, *table_id, row.into_product_value())?;
-            Ok(())
-        })
     }
 
     fn insert_bulk<T: BenchTable>(&mut self, table_id: &Self::TableId, rows: Vec<T>) -> ResultBench<()> {
@@ -115,7 +127,7 @@ impl BenchDatabase for SpacetimeRaw {
                 // (update_by_{field} -> spacetimedb::query::update_by_field -> (delete_by_col_eq; insert))
                 let id = self
                     .db
-                    .iter_by_col_eq_mut(&ctx, tx, *table_id, ColId(0), row.elements[0].clone())?
+                    .iter_by_col_eq_mut(&ctx, tx, *table_id, 0, &row.elements[0])?
                     .next()
                     .expect("failed to find row during update!")
                     .pointer();
@@ -152,13 +164,12 @@ impl BenchDatabase for SpacetimeRaw {
     fn filter<T: BenchTable>(
         &mut self,
         table_id: &Self::TableId,
-        column_index: u32,
+        col_id: impl Into<ColId>,
         value: AlgebraicValue,
     ) -> ResultBench<()> {
-        let col: ColId = column_index.into();
         let ctx = ExecutionContext::default();
         self.db.with_auto_commit(&ctx, |tx| {
-            for row in self.db.iter_by_col_eq_mut(&ctx, tx, *table_id, col, value)? {
+            for row in self.db.iter_by_col_eq_mut(&ctx, tx, *table_id, col_id, &value)? {
                 black_box(row);
             }
             Ok(())

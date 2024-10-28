@@ -1,9 +1,12 @@
 pub mod api;
+mod common_args;
 mod config;
 mod edit_distance;
+mod errors;
 mod subcommands;
 mod tasks;
 pub mod util;
+
 use clap::{ArgMatches, Command};
 
 pub use config::Config;
@@ -28,11 +31,11 @@ pub fn get_subcommands() -> Vec<Command> {
         dns::cli(),
         generate::cli(),
         list::cli(),
-        local::cli(),
         init::cli(),
         build::cli(),
         server::cli(),
         upgrade::cli(),
+        subscribe::cli(),
         #[cfg(feature = "standalone")]
         start::cli(ProgramMode::CLI),
     ]
@@ -50,15 +53,15 @@ pub async fn exec_subcommand(config: Config, cmd: &str, args: &ArgMatches) -> Re
         "logs" => logs::exec(config, args).await,
         "sql" => sql::exec(config, args).await,
         "dns" => dns::exec(config, args).await,
-        "generate" => generate::exec(args),
+        "generate" => generate::exec(config, args).await,
         "list" => list::exec(config, args).await,
-        "local" => local::exec(config, args).await,
         "init" => init::exec(config, args).await,
-        "build" => build::exec(config, args).await,
+        "build" => build::exec(config, args).await.map(drop),
         "server" => server::exec(config, args).await,
+        "subscribe" => subscribe::exec(config, args).await,
         #[cfg(feature = "standalone")]
         "start" => start::exec(args).await,
-        "upgrade" => upgrade::exec(args).await,
+        "upgrade" => upgrade::exec(config, args).await,
         unknown => Err(anyhow::anyhow!("Invalid subcommand: {}", unknown)),
     }
 }

@@ -1,5 +1,6 @@
-use spacetimedb_lib::ProductValue;
-use std::{collections::HashSet, marker::PhantomData};
+use core::marker::PhantomData;
+use spacetimedb_data_structures::map::HashSet;
+use spacetimedb_sats::ProductValue;
 
 // NOTE
 // Currently anything that is IntoIterator is also a relation
@@ -107,11 +108,12 @@ impl<S: Iterator<Item = ProductValue>> Iterator for Project<S> {
     type Item = ProductValue;
 
     fn next(&mut self) -> Option<ProductValue> {
-        self.source.next().map(|mut row| {
+        self.source.next().map(|row| {
+            let mut row: Vec<_> = row.elements.into();
             for &i in self.cols.iter().rev() {
-                row.elements.remove(i as usize);
+                row.remove(i as usize);
             }
-            row
+            row.into()
         })
     }
 }
@@ -141,18 +143,15 @@ impl<'a, S: Relation, U: Relation> IntoIterator for Union<'a, S, U> {
     type IntoIter = std::vec::IntoIter<ProductValue>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut set_s: HashSet<ProductValue> = HashSet::new();
-        let mut set_u: HashSet<ProductValue> = HashSet::new();
+        let mut set_s: HashSet<ProductValue> = HashSet::default();
+        let mut set_u: HashSet<ProductValue> = HashSet::default();
         for next in self.s {
             set_s.insert(next);
         }
         for next in self.u {
             set_u.insert(next);
         }
-        std::collections::HashSet::union(&set_s, &set_u)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
+        HashSet::union(&set_s, &set_u).cloned().collect::<Vec<_>>().into_iter()
     }
 }
 
@@ -167,15 +166,15 @@ impl<'a, S: Relation, U: Relation> IntoIterator for Intersection<'a, S, U> {
     type IntoIter = std::vec::IntoIter<ProductValue>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut set_s: HashSet<ProductValue> = HashSet::new();
-        let mut set_u: HashSet<ProductValue> = HashSet::new();
+        let mut set_s: HashSet<ProductValue> = HashSet::default();
+        let mut set_u: HashSet<ProductValue> = HashSet::default();
         for next in self.s {
             set_s.insert(next);
         }
         for next in self.u {
             set_u.insert(next);
         }
-        std::collections::HashSet::intersection(&set_s, &set_u)
+        HashSet::intersection(&set_s, &set_u)
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()
@@ -193,15 +192,15 @@ impl<'a, S: Relation, U: Relation> IntoIterator for Difference<'a, S, U> {
     type IntoIter = std::vec::IntoIter<ProductValue>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut set_s: HashSet<ProductValue> = HashSet::new();
-        let mut set_u: HashSet<ProductValue> = HashSet::new();
+        let mut set_s: HashSet<ProductValue> = HashSet::default();
+        let mut set_u: HashSet<ProductValue> = HashSet::default();
         for next in self.s {
             set_s.insert(next);
         }
         for next in self.u {
             set_u.insert(next);
         }
-        std::collections::HashSet::difference(&set_s, &set_u)
+        HashSet::difference(&set_s, &set_u)
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()

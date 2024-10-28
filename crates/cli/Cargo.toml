@@ -20,14 +20,19 @@ bench = false
 [dependencies]
 spacetimedb-primitives.workspace = true
 spacetimedb-core.workspace = true
-spacetimedb-lib = { workspace = true, features = ["cli"] }
+spacetimedb-data-structures.workspace = true
+spacetimedb-lib.workspace = true
+spacetimedb-schema.workspace = true
 spacetimedb-standalone = { workspace = true, optional = true }
+spacetimedb-client-api-messages.workspace = true
+spacetimedb-fs-utils.workspace = true
 
 anyhow.workspace = true
 base64.workspace = true
+bytes.workspace = true
 cargo_metadata.workspace = true
 chrono.workspace = true
-clap = {workspace = true, features = ["derive", "env", "string"]}
+clap = { workspace = true, features = ["derive", "env", "string"] }
 colored.workspace = true
 convert_case.workspace = true
 dirs.workspace = true
@@ -35,6 +40,7 @@ duct.workspace = true
 email_address.workspace = true
 futures.workspace = true
 flate2.workspace = true
+http.workspace = true
 is-terminal.workspace = true
 itertools.workspace = true
 indicatif.workspace = true
@@ -52,13 +58,17 @@ tabled.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 termcolor.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 toml.workspace = true
 wasmbin.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+fs-err.workspace = true
+spacetimedb-testing = { path = "../testing" }
 
 [features]
 standalone = ["spacetimedb-standalone"]

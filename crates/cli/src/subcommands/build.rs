@@ -1,23 +1,23 @@
 use crate::Config;
 use clap::ArgAction::SetTrue;
 use clap::{Arg, ArgMatches};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn cli() -> clap::Command {
     clap::Command::new("build")
         .about("Builds a spacetime module.")
         .arg(
-            Arg::new("project-path")
-                .default_value(".")
+            Arg::new("project_path")
+                .long("project-path")
+                .short('p')
                 .value_parser(clap::value_parser!(PathBuf))
-                .help("The path of the project that you would like to build."),
+                .default_value(".")
+                .help("The system path (absolute or relative) to the project you would like to build")
         )
         .arg(
             Arg::new("skip_clippy")
-                .long("skip_clippy")
-                .short('s')
+                .long("skip-println-checks")
                 .action(SetTrue)
-                .env("SPACETIME_SKIP_CLIPPY")
                 .value_parser(clap::builder::FalseyValueParser::new())
                 .help("Skips running clippy on the module before building (intended to speed up local iteration, not recommended for CI)"),
         )
@@ -30,8 +30,8 @@ pub fn cli() -> clap::Command {
         )
 }
 
-pub async fn exec(_: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
-    let project_path = args.get_one::<PathBuf>("project-path").unwrap();
+pub async fn exec(_config: Config, args: &ArgMatches) -> Result<PathBuf, anyhow::Error> {
+    let project_path = args.get_one::<PathBuf>("project_path").unwrap();
     let skip_clippy = args.get_flag("skip_clippy");
     let build_debug = args.get_flag("debug");
 
@@ -50,8 +50,20 @@ pub async fn exec(_: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
         ));
     }
 
-    crate::tasks::build(project_path, skip_clippy, build_debug)?;
+    let bin_path = crate::tasks::build(project_path, skip_clippy, build_debug)?;
     println!("Build finished successfully.");
 
-    Ok(())
+    Ok(bin_path)
+}
+
+pub async fn exec_with_argstring(
+    config: Config,
+    project_path: &Path,
+    arg_string: &str,
+) -> Result<PathBuf, anyhow::Error> {
+    // Note: "build" must be the start of the string, because `build::cli()` is the entire build subcommand.
+    // If we don't include this, the args will be misinterpreted (e.g. as commands).
+    let arg_string = format!("build {} --project-path {}", arg_string, project_path.display());
+    let arg_matches = cli().get_matches_from(arg_string.split_whitespace());
+    exec(config.clone(), &arg_matches).await
 }

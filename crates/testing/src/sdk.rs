@@ -1,7 +1,7 @@
 use duct::cmd;
 use lazy_static::lazy_static;
 use rand::distributions::{Alphanumeric, DistString};
-use std::collections::HashMap;
+use spacetimedb_data_structures::map::HashMap;
 use std::fs::create_dir_all;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -119,7 +119,7 @@ macro_rules! memoized {
         MEMOIZED
             .lock()
             .unwrap()
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(HashMap::default)
             .entry($key)
             .or_insert_with_key(|$key| -> $value_ty { $body })
             .clone()
@@ -145,14 +145,7 @@ fn compile_module(module: &str) -> String {
 // module as a separate clean database instance for isolation purposes.
 fn publish_module(wasm_file: &str) -> String {
     let name = random_module_name();
-    invoke_cli(&[
-        "publish",
-        "--debug",
-        "--project-path",
-        wasm_file,
-        "--skip_clippy",
-        &name,
-    ]);
+    invoke_cli(&["publish", "--server", "local", "--bin-path", wasm_file, &name]);
     name
 }
 
@@ -192,14 +185,12 @@ fn generate_bindings(language: &str, wasm_file: &str, client_project: &str, gene
         create_dir_all(generate_dir).expect("Error creating generate subdir");
         invoke_cli(&[
             "generate",
-            "--debug",
-            "--skip_clippy",
             "--lang",
             language,
-            "--wasm-file",
+            "--bin-path",
             wasm_file,
             "--out-dir",
-            &generate_dir,
+            generate_dir,
         ]);
     })
 }

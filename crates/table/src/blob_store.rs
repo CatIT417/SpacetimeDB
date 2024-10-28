@@ -12,23 +12,28 @@
 //!   It is not optimize and is mainly intended for testing purposes.
 
 use blake3::hash;
-use std::collections::{hash_map::Entry, HashMap};
+use spacetimedb_data_structures::map::{Entry, HashMap};
+use spacetimedb_lib::{de::Deserialize, ser::Serialize};
+
+use crate::MemoryUsage;
 
 /// The content address of a blob-stored object.
-#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy, Hash, Debug)]
+#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Copy, Hash, Debug, Serialize, Deserialize)]
 pub struct BlobHash {
     /// The hash of the blob-stored object.
     ///
     /// Uses BLAKE3 which fits in 32 bytes.
-    pub data: [u8; Self::SIZE],
+    pub data: [u8; BlobHash::SIZE],
 }
+
+impl MemoryUsage for BlobHash {}
 
 impl BlobHash {
     /// The size of the hash function's output in bytes.
     pub const SIZE: usize = 32;
 
     /// Returns the blob hash for `bytes`.
-    fn hash_from_bytes(bytes: &[u8]) -> Self {
+    pub fn hash_from_bytes(bytes: &[u8]) -> Self {
         let data = hash(bytes).into();
         Self { data }
     }
@@ -47,11 +52,19 @@ impl TryFrom<&[u8]> for BlobHash {
 #[derive(Debug)]
 pub struct NoSuchBlobError;
 
+/// Iterator returned by [`BlobStore::iter_blobs`].
+///
+/// Each element is a tuple `(hash, uses, data)`,
+/// where `hash` is a blob's content-addressed [`BlobHash`],
+/// `uses` is the number of references to that blob,
+/// and `data` is the data itself.
+pub type BlobsIter<'a> = Box<dyn Iterator<Item = (&'a BlobHash, usize, &'a [u8])> + 'a>;
+
 /// The interface that tables use to talk to the blob store engine for large var-len objects.
 ///
 /// These blob objects are referred to by their [`BlobHash`],
 /// which is currently defined through BLAKE3 on the bytes of the blob object.
-pub trait BlobStore {
+pub trait BlobStore: Sync {
     /// Mark the `hash` as used.
     ///
     /// This is a more efficient way of doing:
@@ -67,6 +80,11 @@ pub trait BlobStore {
     /// which can be used in [`retrieve_blob`] to fetch it.
     fn insert_blob(&mut self, bytes: &[u8]) -> BlobHash;
 
+    /// Insert `hash` referring to `bytes` and mark its refcount as `uses`.
+    ///
+    /// Used when restoring from a snapshot.
+    fn insert_with_uses(&mut self, hash: &BlobHash, uses: usize, bytes: Box<[u8]>);
+
     /// Returns the bytes stored at the content address `hash`.
     fn retrieve_blob(&self, hash: &BlobHash) -> Result<&[u8], NoSuchBlobError>;
 
@@ -76,6 +94,16 @@ pub trait BlobStore {
     /// this might not actually free the data,
     /// but rather just decrement a reference count.
     fn free_blob(&mut self, hash: &BlobHash) -> Result<(), NoSuchBlobError>;
+
+    /// Iterate over all blobs present in the blob store.
+    ///
+    /// Each element is a tuple `(hash, uses, data)`,
+    /// where `hash` is a blob's content-addressed [`BlobHash`],
+    /// `uses` is the number of references to that blob,
+    /// and `data` is the data itself.
+    ///
+    /// Used when capturing a snapshot.
+    fn iter_blobs(&self) -> BlobsIter<'_>;
 }
 
 /// A blob store that panics on all operations.
@@ -91,11 +119,20 @@ impl BlobStore for NullBlobStore {
     fn insert_blob(&mut self, _bytes: &[u8]) -> BlobHash {
         unimplemented!("NullBlobStore doesn't do anything")
     }
+
+    fn insert_with_uses(&mut self, _hash: &BlobHash, _uses: usize, _bytes: Box<[u8]>) {
+        unimplemented!("NullBlobStore doesn't do anything")
+    }
+
     fn retrieve_blob(&self, _hash: &BlobHash) -> Result<&[u8], NoSuchBlobError> {
         unimplemented!("NullBlobStore doesn't do anything")
     }
 
     fn free_blob(&mut self, _hash: &BlobHash) -> Result<(), NoSuchBlobError> {
+        unimplemented!("NullBlobStore doesn't do anything")
+    }
+
+    fn iter_blobs(&self) -> BlobsIter<'_> {
         unimplemented!("NullBlobStore doesn't do anything")
     }
 }
@@ -109,12 +146,26 @@ pub struct HashMapBlobStore {
     map: HashMap<BlobHash, BlobObject>,
 }
 
+impl MemoryUsage for HashMapBlobStore {
+    fn heap_usage(&self) -> usize {
+        let Self { map } = self;
+        map.heap_usage()
+    }
+}
+
 /// A blob object including a reference count and the data.
 struct BlobObject {
     /// Reference count of the blob.
     uses: usize,
     /// The blob data.
     blob: Box<[u8]>,
+}
+
+impl MemoryUsage for BlobObject {
+    fn heap_usage(&self) -> usize {
+        let Self { uses, blob } = self;
+        uses.heap_usage() + blob.heap_usage()
+    }
 }
 
 impl BlobStore for HashMapBlobStore {
@@ -135,6 +186,14 @@ impl BlobStore for HashMapBlobStore {
         hash
     }
 
+    fn insert_with_uses(&mut self, hash: &BlobHash, uses: usize, bytes: Box<[u8]>) {
+        debug_assert_eq!(hash, &BlobHash::hash_from_bytes(&bytes));
+        self.map
+            .entry(*hash)
+            .and_modify(|v| v.uses += uses)
+            .or_insert_with(|| BlobObject { blob: bytes, uses });
+    }
+
     fn retrieve_blob(&self, hash: &BlobHash) -> Result<&[u8], NoSuchBlobError> {
         self.map.get(hash).map(|obj| &*obj.blob).ok_or(NoSuchBlobError)
     }
@@ -146,6 +205,10 @@ impl BlobStore for HashMapBlobStore {
             Entry::Occupied(mut entry) => entry.get_mut().uses -= 1,
         }
         Ok(())
+    }
+
+    fn iter_blobs(&self) -> BlobsIter<'_> {
+        Box::new(self.map.iter().map(|(hash, obj)| (hash, obj.uses, &obj.blob[..])))
     }
 }
 

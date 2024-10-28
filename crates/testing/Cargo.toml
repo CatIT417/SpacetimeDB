@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 spacetimedb-cli.workspace = true
+spacetimedb-data-structures.workspace = true
 spacetimedb-lib.workspace = true
 spacetimedb-core.workspace = true
 spacetimedb-standalone.workspace = true
@@ -20,7 +21,6 @@ wasmbin.workspace = true
 duct.workspace = true
 lazy_static.workspace = true
 rand.workspace = true
-prost.workspace = true
 tempfile.workspace = true
 serde.workspace = true
 
