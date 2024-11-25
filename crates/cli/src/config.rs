@@ -34,6 +34,19 @@ impl ServerConfig {
         set_table_opt_value(edit, "ecdsa_public_key", from.ecdsa_public_key.as_deref());
     }
 
+    pub fn from_table(table: &Table) -> Self {
+        let nickname = table.get("nickname").and_then(Item::as_str).map(String::from);
+        let host = table.get("host").and_then(Item::as_str).map(String::from).unwrap();
+        let protocol = table.get("protocol").and_then(Item::as_str).map(String::from).unwrap();
+        let ecdsa_public_key = table.get("ecdsa_public_key").and_then(Item::as_str).map(String::from);
+        ServerConfig {
+            nickname,
+            host,
+            protocol,
+            ecdsa_public_key,
+        }
+    }
+
     fn nick_or_host(&self) -> &str {
         if let Some(nick) = &self.nickname {
             nick
@@ -390,6 +403,7 @@ Fetch the server's fingerprint with:
         self.spacetimedb_token = None;
     }
 }
+
 impl From<&DocumentMut> for RawConfig {
     fn from(value: &DocumentMut) -> Self {
         let default_server = value.get("default_server").and_then(Item::as_str).map(String::from);
@@ -590,39 +604,35 @@ impl Config {
             doc.remove("server_configs");
             return doc;
         }
-        // ... or if there are no server_configs to edit.
-        let server_configs = if let Some(cfg) = doc.get_mut("server_configs").and_then(Item::as_array_of_tables_mut) {
-            cfg
-        } else {
-            doc["server_configs"] =
-                Item::ArrayOfTables(self.home.server_configs.iter().map(ServerConfig::as_table).collect());
-            return doc;
-        };
 
-        let mut new_configs = self
-            .home
-            .server_configs
+        let old_server_configs = doc
+            .get_mut("server_configs")
+            .and_then(Item::as_array_of_tables_mut)
+            .unwrap_or_else(|| vec![]);
+        let old_server_configs = old_server_configs
             .iter()
-            .map(|cfg| (cfg.nick_or_host(), cfg))
+            .map(|table| {
+                let cfg = ServerConfig::from_table(table);
+                (cfg.nick_or_host(), table)
+            })
             .collect::<HashMap<_, _>>();
 
         // Update the existing servers.
-        let mut new_vec = Vec::with_capacity(self.home.server_configs.len());
-        for old_config in server_configs.iter_mut() {
-            let nick_or_host = old_config
-                .get("nickname")
-                .or_else(|| old_config.get("host"))
-                .and_then(|v| v.as_str())
-                .unwrap();
-            if let Some(new_config) = new_configs.remove(nick_or_host) {
-                ServerConfig::update_table(old_config, new_config);
-                new_vec.push(old_config.clone());
-            }
-        }
+        let new_server_configs: Vec<_> = self
+            .home
+            .server_configs
+            .iter()
+            .map(|new_config| {
+                if let Some(old_config) = old_server_configs.get(new_config.nick_or_host()) {
+                    ServerConfig::update_table(old_config, new_config);
+                    old_config
+                } else {
+                    new_config.as_table()
+                }
+            })
+            .collect();
 
-        // Add the new servers.
-        new_vec.extend(new_configs.values().cloned().map(ServerConfig::as_table));
-        *server_configs = ArrayOfTables::from_iter(new_vec);
+        doc["server_configs"] = ArrayOfTables::from_iter(new_server_configs);
 
         doc
     }
