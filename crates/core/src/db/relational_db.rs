@@ -1309,10 +1309,15 @@ fn default_row_count_fn(db: Identity) -> RowCountFn {
 #[cfg(any(test, feature = "test"))]
 pub mod tests_utils {
     use super::*;
+    use crate::sql::ast::{SchemaViewer, TableSchemaView};
     use core::ops::Deref;
     use durability::EmptyHistory;
+    use expect_test::Expect;
+    use spacetimedb_lib::identity::AuthCtx;
     use spacetimedb_lib::{bsatn::to_vec, ser::Serialize};
     use spacetimedb_paths::FromPathUnchecked;
+    use spacetimedb_physical_plan::plan::tests_utils::*;
+    use spacetimedb_physical_plan::printer::ExplainOptions;
     use tempfile::TempDir;
 
     /// A [`RelationalDB`] in a temporary directory.
@@ -1599,6 +1604,20 @@ pub mod tests_utils {
             commitlog::tests::helpers::fill_log_with(&mut log, txes);
             Self(log)
         }
+    }
+
+    pub fn expect_query<T: TableSchemaView + StateView>(tx: &T, sql: &str, expect: Expect) {
+        let auth = AuthCtx::for_testing();
+        let schema = SchemaViewer::new(tx, &auth);
+
+        check_query(&schema, ExplainOptions::default(), sql, expect)
+    }
+
+    pub fn expect_sub<T: TableSchemaView + StateView>(tx: &T, sql: &str, expect: Expect) {
+        let auth = AuthCtx::for_testing();
+        let schema = SchemaViewer::new(tx, &auth);
+
+        check_sub(&schema, ExplainOptions::default(), sql, expect)
     }
 }
 
