@@ -5,7 +5,7 @@ use std::collections::btree_map::{BTreeMap, Entry, Range};
 /// A "unique map" that relates a `K` to a `V`.
 ///
 /// (This is just a `BTreeMap<K, V>`) with a slightly modified interface.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct UniqueMap<K, V> {
     /// The map is backed by a `BTreeMap` for relating a key to a value.
     map: BTreeMap<K, V>,
@@ -77,7 +77,7 @@ impl<K: Ord, V: Ord> UniqueMap<K, V> {
     }
 }
 
-/// An iterator over values in a [`MultiMap`] where the keys are in a certain range.
+/// An iterator over values in a [`UniqueMap`] where the keys are in a certain range.
 pub struct UniqueMapRangeIter<'a, K, V> {
     /// The iterator seeking for matching keys in the range.
     iter: Range<'a, K, V>,
