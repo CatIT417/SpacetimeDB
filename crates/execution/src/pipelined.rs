@@ -103,9 +103,7 @@ impl PipelinedProject {
                 // They return a tuple of row ids or product values.
                 plan.execute(tx, metrics, &mut |t| {
                     n += 1;
-                    if let Some(row) = t.select(*i) {
-                        f(row)?;
-                    }
+                    f(t.try_select(*i)?)?;
                     Ok(())
                 })?;
             }
@@ -399,6 +397,10 @@ impl PipelinedIxJoin {
         let mut index_seeks = 0;
         let mut bytes_scanned = 0;
 
+        let mut inc_metrics = |value: &AlgebraicValue| {
+            bytes_scanned += value.size_of();
+        };
+
         match self {
             Self {
                 lhs,
@@ -412,7 +414,7 @@ impl PipelinedIxJoin {
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
                     index_seeks += 1;
-                    if rhs_index.contains_any(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if rhs_index.contains_any(&project(&u, lhs_field, &mut inc_metrics)?) {
                         f(u)?;
                     }
                     Ok(())
@@ -430,7 +432,7 @@ impl PipelinedIxJoin {
                     n += 1;
                     index_seeks += 1;
                     if let Some(v) = rhs_index
-                        .seek(&project(&u, lhs_field, &mut bytes_scanned))
+                        .seek(&project(&u, lhs_field, &mut inc_metrics)?)
                         .next()
                         .and_then(|ptr| rhs_table.get_row_ref(blob_store, ptr))
                         .map(Row::Ptr)
@@ -453,7 +455,7 @@ impl PipelinedIxJoin {
                     n += 1;
                     index_seeks += 1;
                     if let Some(v) = rhs_index
-                        .seek(&project(&u, lhs_field, &mut bytes_scanned))
+                        .seek(&project(&u, lhs_field, &mut inc_metrics)?)
                         .next()
                         .and_then(|ptr| rhs_table.get_row_ref(blob_store, ptr))
                         .map(Row::Ptr)
@@ -476,7 +478,7 @@ impl PipelinedIxJoin {
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
                     index_seeks += 1;
-                    if let Some(n) = rhs_index.count(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if let Some(n) = rhs_index.count(&project(&u, lhs_field, &mut inc_metrics)?) {
                         for _ in 0..n {
                             f(u.clone())?;
                         }
@@ -496,7 +498,7 @@ impl PipelinedIxJoin {
                     n += 1;
                     index_seeks += 1;
                     for v in rhs_index
-                        .seek(&project(&u, lhs_field, &mut bytes_scanned))
+                        .seek(&project(&u, lhs_field, &mut inc_metrics)?)
                         .filter_map(|ptr| rhs_table.get_row_ref(blob_store, ptr))
                         .map(Row::Ptr)
                         .map(Tuple::Row)
@@ -518,7 +520,7 @@ impl PipelinedIxJoin {
                     n += 1;
                     index_seeks += 1;
                     for v in rhs_index
-                        .seek(&project(&u, lhs_field, &mut bytes_scanned))
+                        .seek(&project(&u, lhs_field, &mut inc_metrics)?)
                         .filter_map(|ptr| rhs_table.get_row_ref(blob_store, ptr))
                         .map(Row::Ptr)
                         .map(Tuple::Row)
@@ -557,6 +559,9 @@ impl BlockingHashJoin {
     ) -> Result<()> {
         let mut n = 0;
         let mut bytes_scanned = 0;
+        let mut inc_metrics = |value: &AlgebraicValue| {
+            bytes_scanned += value.size_of();
+        };
         match self {
             Self {
                 lhs,
@@ -568,7 +573,7 @@ impl BlockingHashJoin {
             } => {
                 let mut rhs_table = HashSet::new();
                 rhs.execute(tx, metrics, &mut |v| {
-                    rhs_table.insert(project(&v, rhs_field, &mut bytes_scanned));
+                    rhs_table.insert(project(&v, rhs_field, &mut inc_metrics)?);
                     Ok(())
                 })?;
 
@@ -577,7 +582,7 @@ impl BlockingHashJoin {
 
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if rhs_table.contains(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if rhs_table.contains(&project(&u, lhs_field, &mut inc_metrics)?) {
                         f(u)?;
                     }
                     Ok(())
@@ -593,7 +598,7 @@ impl BlockingHashJoin {
             } => {
                 let mut rhs_table = HashMap::new();
                 rhs.execute(tx, metrics, &mut |v| {
-                    rhs_table.insert(project(&v, rhs_field, &mut bytes_scanned), v);
+                    rhs_table.insert(project(&v, rhs_field, &mut inc_metrics)?, v);
                     Ok(())
                 })?;
 
@@ -602,7 +607,7 @@ impl BlockingHashJoin {
 
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if let Some(v) = rhs_table.get(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if let Some(v) = rhs_table.get(&project(&u, lhs_field, &mut inc_metrics)?) {
                         f(v.clone())?;
                     }
                     Ok(())
@@ -618,7 +623,7 @@ impl BlockingHashJoin {
             } => {
                 let mut rhs_table = HashMap::new();
                 rhs.execute(tx, metrics, &mut |v| {
-                    rhs_table.insert(project(&v, rhs_field, &mut bytes_scanned), v);
+                    rhs_table.insert(project(&v, rhs_field, &mut inc_metrics)?, v);
                     Ok(())
                 })?;
 
@@ -627,7 +632,7 @@ impl BlockingHashJoin {
 
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if let Some(v) = rhs_table.get(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if let Some(v) = rhs_table.get(&project(&u, lhs_field, &mut inc_metrics)?) {
                         f(u.clone().join(v.clone()))?;
                     }
                     Ok(())
@@ -645,14 +650,14 @@ impl BlockingHashJoin {
                 rhs.execute(tx, metrics, &mut |v| {
                     n += 1;
                     rhs_table
-                        .entry(project(&v, rhs_field, &mut bytes_scanned))
+                        .entry(project(&v, rhs_field, &mut inc_metrics)?)
                         .and_modify(|n| *n += 1)
                         .or_insert(1);
                     Ok(())
                 })?;
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if let Some(n) = rhs_table.get(&project(&u, lhs_field, &mut bytes_scanned)).copied() {
+                    if let Some(n) = rhs_table.get(&project(&u, lhs_field, &mut inc_metrics)?).copied() {
                         for _ in 0..n {
                             f(u.clone())?;
                         }
@@ -671,7 +676,7 @@ impl BlockingHashJoin {
                 let mut rhs_table: HashMap<AlgebraicValue, Vec<_>> = HashMap::new();
                 rhs.execute(tx, metrics, &mut |v| {
                     n += 1;
-                    let key = project(&v, rhs_field, &mut bytes_scanned);
+                    let key = project(&v, rhs_field, &mut inc_metrics)?;
                     if let Some(tuples) = rhs_table.get_mut(&key) {
                         tuples.push(v);
                     } else {
@@ -681,7 +686,7 @@ impl BlockingHashJoin {
                 })?;
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if let Some(rhs_tuples) = rhs_table.get(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if let Some(rhs_tuples) = rhs_table.get(&project(&u, lhs_field, &mut inc_metrics)?) {
                         for v in rhs_tuples {
                             f(v.clone())?;
                         }
@@ -700,7 +705,7 @@ impl BlockingHashJoin {
                 let mut rhs_table: HashMap<AlgebraicValue, Vec<_>> = HashMap::new();
                 rhs.execute(tx, metrics, &mut |v| {
                     n += 1;
-                    let key = project(&v, rhs_field, &mut bytes_scanned);
+                    let key = project(&v, rhs_field, &mut inc_metrics)?;
                     if let Some(tuples) = rhs_table.get_mut(&key) {
                         tuples.push(v);
                     } else {
@@ -710,7 +715,7 @@ impl BlockingHashJoin {
                 })?;
                 lhs.execute(tx, metrics, &mut |u| {
                     n += 1;
-                    if let Some(rhs_tuples) = rhs_table.get(&project(&u, lhs_field, &mut bytes_scanned)) {
+                    if let Some(rhs_tuples) = rhs_table.get(&project(&u, lhs_field, &mut inc_metrics)?) {
                         for v in rhs_tuples {
                             f(u.clone().join(v.clone()))?;
                         }
@@ -779,7 +784,9 @@ impl PipelinedFilter {
         let mut bytes_scanned = 0;
         self.input.execute(tx, metrics, &mut |t| {
             n += 1;
-            if self.expr.eval_bool_with_metrics(&t, &mut bytes_scanned) {
+            if self.expr.try_eval_bool(&t, &mut |v| {
+                bytes_scanned += v.size_of();
+            })? {
                 f(t)?;
             }
             Ok(())
@@ -790,9 +797,9 @@ impl PipelinedFilter {
     }
 }
 
-/// A wrapper around [ProjectField] that increments a counter by the size of the projected value
-fn project(row: &impl ProjectField, field: &TupleField, bytes_scanned: &mut usize) -> AlgebraicValue {
-    let value = row.project(field);
-    *bytes_scanned += value.size_of();
-    value
+/// A wrapper around [ProjectField] that passes the projected value to closure
+fn project(row: &impl ProjectField, field: &TupleField, f: &mut impl FnMut(&AlgebraicValue)) -> Result<AlgebraicValue> {
+    let value = row.try_project(field)?;
+    f(&value);
+    Ok(value)
 }

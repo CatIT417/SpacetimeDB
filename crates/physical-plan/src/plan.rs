@@ -4,10 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use derive_more::From;
 use spacetimedb_expr::StatementSource;
-use spacetimedb_lib::{query::Delta, sats::size_of::SizeOf, AlgebraicValue, ProductValue};
+use spacetimedb_lib::{query::Delta, AlgebraicValue, ProductValue};
 use spacetimedb_primitives::{ColId, ColSet, IndexId};
 use spacetimedb_schema::schema::{IndexSchema, TableSchema};
 use spacetimedb_sql_parser::ast::{BinOp, LogOp};
@@ -847,18 +847,26 @@ pub enum PhysicalExpr {
 /// Some operators return [RowRef]s.
 /// Some joins return tuples of combined [RowRef]s.
 pub trait ProjectField {
-    fn project(&self, field: &TupleField) -> AlgebraicValue;
+    fn try_project(&self, field: &TupleField) -> Result<AlgebraicValue>;
+
+    fn project(&self, field: &TupleField) -> AlgebraicValue {
+        self.try_project(field).unwrap()
+    }
 }
 
 impl ProjectField for RowRef<'_> {
-    fn project(&self, field: &TupleField) -> AlgebraicValue {
-        self.read_col(field.field_pos).unwrap()
+    fn try_project(&self, field: &TupleField) -> Result<AlgebraicValue> {
+        Ok(self.read_col(field.field_pos)?)
     }
 }
 
 impl ProjectField for &'_ ProductValue {
-    fn project(&self, field: &TupleField) -> AlgebraicValue {
-        self.elements[field.field_pos].clone()
+    fn try_project(&self, field: &TupleField) -> Result<AlgebraicValue> {
+        self.elements.get(field.field_pos).cloned().ok_or_else(|| {
+            let i = field.field_pos;
+            let n = self.elements.len();
+            anyhow!("Index {i} out of bounds: row has {n} fields",)
+        })
     }
 }
 
@@ -912,21 +920,26 @@ impl PhysicalExpr {
         self.eval(row).as_bool().copied().unwrap_or(false)
     }
 
-    /// Evaluate this boolean expression over `row`
-    pub fn eval_bool_with_metrics(&self, row: &impl ProjectField, bytes_scanned: &mut usize) -> bool {
-        self.eval_with_metrics(row, bytes_scanned)
-            .as_bool()
-            .copied()
-            .unwrap_or(false)
-    }
-
     /// Evaluate this expression over `row`
     fn eval(&self, row: &impl ProjectField) -> Cow<'_, AlgebraicValue> {
-        self.eval_with_metrics(row, &mut 0)
+        self.try_eval(row, &mut |_| {}).unwrap()
     }
 
-    /// Evaluate this expression over `row`
-    fn eval_with_metrics(&self, row: &impl ProjectField, bytes_scanned: &mut usize) -> Cow<'_, AlgebraicValue> {
+    /// Try to evaluate this boolean expression over `row`
+    pub fn try_eval_bool(&self, row: &impl ProjectField, f: &mut impl FnMut(&AlgebraicValue)) -> Result<bool> {
+        self.try_eval(row, f).and_then(|v| {
+            v.as_bool()
+                .copied()
+                .ok_or_else(|| anyhow!("Expected a boolean valued expression"))
+        })
+    }
+
+    /// Try to evaluate this expression over `row`
+    fn try_eval(
+        &self,
+        row: &impl ProjectField,
+        f: &mut impl FnMut(&AlgebraicValue),
+    ) -> Result<Cow<'_, AlgebraicValue>> {
         fn eval_bin_op(op: BinOp, a: &AlgebraicValue, b: &AlgebraicValue) -> bool {
             match op {
                 BinOp::Eq => a == b,
@@ -937,31 +950,42 @@ impl PhysicalExpr {
                 BinOp::Gte => a >= b,
             }
         }
-        let into = |b| Cow::Owned(AlgebraicValue::Bool(b));
+        let into = |b| Ok(Cow::Owned(AlgebraicValue::Bool(b)));
         match self {
-            Self::BinOp(op, a, b) => into(eval_bin_op(
-                *op,
-                &a.eval_with_metrics(row, bytes_scanned),
-                &b.eval_with_metrics(row, bytes_scanned),
-            )),
-            Self::LogOp(LogOp::And, exprs) => into(
-                exprs
-                    .iter()
-                    // ALL is equivalent to AND
-                    .all(|expr| expr.eval_bool_with_metrics(row, bytes_scanned)),
-            ),
-            Self::LogOp(LogOp::Or, exprs) => into(
-                exprs
-                    .iter()
-                    // ANY is equivalent to OR
-                    .any(|expr| expr.eval_bool_with_metrics(row, bytes_scanned)),
-            ),
-            Self::Field(field) => {
-                let value = row.project(field);
-                *bytes_scanned += value.size_of();
-                Cow::Owned(value)
+            Self::BinOp(op, a, b) => {
+                let a = a.try_eval(row, f)?;
+                let b = b.try_eval(row, f)?;
+                f(&a);
+                f(&b);
+                into(eval_bin_op(*op, &a, &b))
             }
-            Self::Value(v) => Cow::Borrowed(v),
+            Self::LogOp(LogOp::And, exprs) => {
+                let mut all = true;
+                for expr in exprs {
+                    let v = expr.try_eval_bool(row, f)?;
+                    all = all && v;
+                    f(&AlgebraicValue::Bool(v))
+                }
+                into(all)
+            }
+            Self::LogOp(LogOp::Or, exprs) => {
+                let mut any = false;
+                for expr in exprs {
+                    let v = expr.try_eval_bool(row, f)?;
+                    any = any || v;
+                    f(&AlgebraicValue::Bool(v))
+                }
+                into(any)
+            }
+            Self::Field(field) => {
+                let v = row.try_project(field)?;
+                f(&v);
+                Ok(Cow::Owned(v))
+            }
+            Self::Value(v) => {
+                f(v);
+                Ok(Cow::Borrowed(v))
+            }
         }
     }
 

@@ -53,7 +53,7 @@ impl<'a> Iterator for ProjectIter<'a> {
                 }
                 None
             }),
-            Self::Some(iter, i) => iter.find_map(|tuple| tuple.select(*i)),
+            Self::Some(iter, i) => iter.next().map(|tuple| tuple.select(*i)),
         }
     }
 }

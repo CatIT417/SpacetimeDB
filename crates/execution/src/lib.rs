@@ -1,6 +1,6 @@
 use std::ops::RangeBounds;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use iter::PlanIter;
 use spacetimedb_lib::{
     bsatn::{EncodeError, ToBsatn},
@@ -118,10 +118,10 @@ impl ToBsatn for Row<'_> {
 }
 
 impl ProjectField for Row<'_> {
-    fn project(&self, field: &TupleField) -> AlgebraicValue {
+    fn try_project(&self, field: &TupleField) -> Result<AlgebraicValue> {
         match self {
-            Self::Ptr(ptr) => ptr.project(field),
-            Self::Ref(val) => val.project(field),
+            Self::Ptr(ptr) => ptr.try_project(field),
+            Self::Ref(val) => val.try_project(field),
         }
     }
 }
@@ -138,25 +138,40 @@ pub enum Tuple<'a> {
 static_assert_size!(Tuple, 40);
 
 impl ProjectField for Tuple<'_> {
-    fn project(&self, field: &TupleField) -> AlgebraicValue {
+    fn try_project(&self, field: &TupleField) -> Result<AlgebraicValue> {
         match self {
-            Self::Row(row) => row.project(field),
-            Self::Join(ptrs) => field
-                .label_pos
-                .and_then(|i| ptrs.get(i))
-                .map(|ptr| ptr.project(field))
-                .unwrap(),
+            Self::Row(row) => row.try_project(field),
+            Self::Join(ptrs) => {
+                let n = ptrs.len();
+                let Some(i) = field.label_pos else {
+                    bail!("Operation expected a row id, but got a tuple of row ids instead")
+                };
+                ptrs.get(i)
+                    .ok_or_else(|| anyhow!("Index {i} out of bounds: tuple has {n} elements"))
+                    .and_then(|ptr| ptr.try_project(field))
+            }
         }
     }
 }
 
 impl<'a> Tuple<'a> {
-    /// Select the tuple element at position `i`
-    fn select(self, i: usize) -> Option<Row<'a>> {
+    /// Try to select the tuple element at position `i`
+    fn try_select(self, i: usize) -> Result<Row<'a>> {
         match self {
-            Self::Row(_) => None,
-            Self::Join(mut ptrs) => Some(ptrs.swap_remove(i)),
+            Self::Row(_) => bail!("Operation expected a tuple of row ids instead, but got a row id instead"),
+            Self::Join(mut ptrs) => {
+                let n = ptrs.len();
+                if i >= n {
+                    bail!("Index {i} out of bounds: tuple has {n} elements")
+                }
+                Ok(ptrs.swap_remove(i))
+            }
         }
+    }
+
+    /// Select the tuple element at position `i`
+    fn select(self, i: usize) -> Row<'a> {
+        self.try_select(i).unwrap()
     }
 
     /// Append a [Row] to a tuple
