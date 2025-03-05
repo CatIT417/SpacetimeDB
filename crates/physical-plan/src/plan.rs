@@ -1152,11 +1152,9 @@ pub mod tests_utils {
 mod tests {
     use super::*;
 
-    use crate::compile::compile_select_list;
     use crate::printer::ExplainOptions;
     use expect_test::{expect, Expect};
     use spacetimedb_expr::check::SchemaView;
-    use spacetimedb_expr::statement::{parse_and_type_sql, Statement};
     use spacetimedb_lib::{
         db::auth::{StAccess, StTableType},
         AlgebraicType,
@@ -1858,37 +1856,60 @@ Index Join: Rhs on p
 
         let db = SchemaViewer::new(vec![t.clone()]);
 
-        let compile = |sql| {
-            let stmt = parse_and_type_sql(sql, &db).unwrap();
-            let Statement::Select(select) = stmt else {
-                unreachable!()
-            };
-            compile_select_list(select).optimize().unwrap()
-        };
+        check_query(
+            &db,
+            "SELECT * FROM t LIMIT 5",
+            expect![[r#"
+Limit: 5
+  -> Seq Scan on t
+  Output: t.x, t.y"#]],
+        );
 
-        let plan = compile("select * from t limit 5");
+        check_query(
+            &db,
+            "SELECT * FROM t WHERE x = 1 LIMIT 5",
+            expect![[r#"
+Limit: 5
+  -> Index Scan using Index id 0 on t
+      Index Cond: (t.x = U8(1))
+  Output: t.x, t.y"#]],
+        );
 
-        assert!(matches!(
-            plan,
-            ProjectListPlan::Name(ProjectPlan::None(PhysicalPlan::TableScan(
-                TableScan { limit: Some(5), .. },
-                _
-            )))
-        ));
+        check_query(
+            &db,
+            "SELECT * FROM t WHERE y = 1 LIMIT 5",
+            expect![[r#"
+Limit: 5
+  -> Seq Scan on t
+    Filter: (t.y = U8(1))
+  Output: t.x, t.y"#]],
+        );
+    }
 
-        let plan = compile("select * from t where x = 1 limit 5");
+    #[test]
+    fn count() {
+        let db = data();
 
-        assert!(matches!(
-            plan,
-            ProjectListPlan::Name(ProjectPlan::None(PhysicalPlan::IxScan(
-                IxScan { limit: Some(5), .. },
-                _
-            )))
-        ));
+        check_query(
+            &db,
+            "SELECT COUNT(*) AS n FROM p",
+            expect![[r#"
+Count
+  -> Seq Scan on p
+  Output: p.id, p.name"#]],
+        );
 
-        let plan = compile("select * from t where y = 1 limit 5");
+        check_query(
+            &db,
+            "SELECT COUNT(*) AS n FROM p WHERE id = 1",
+            expect![[r#"
+Count
+  -> Seq Scan on p
+    Filter: (p.id = U64(1))
+  Output: p.id, p.name"#]],
+        );
 
-        assert!(matches!(plan, ProjectListPlan::Limit(_, 5)) && plan.has_filter() && plan.has_table_scan(None));
+        // TODO: Is not yet possible to combine correctly `COUNT` with `LIMIT`
     }
 
     #[test]

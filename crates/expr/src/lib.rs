@@ -52,7 +52,9 @@ pub(crate) fn type_proj(input: RelExpr, proj: ast::Project, vars: &Relvars) -> T
             Ok(ProjectList::Name(ProjectName::Some(input, var)))
         }
         ast::Project::Star(Some(SqlIdent(var))) => Err(Unresolved::var(&var).into()),
-        ast::Project::Count(SqlIdent(alias)) => Ok(ProjectList::Agg(input, AggType::Count, alias, AlgebraicType::U64)),
+        ast::Project::Count(SqlIdent(alias)) => {
+            Ok(ProjectList::Agg(input, AggType::Count { alias }, AlgebraicType::U64))
+        }
         ast::Project::Exprs(elems) => {
             let mut projections = vec![];
             let mut names = HashSet::new();
