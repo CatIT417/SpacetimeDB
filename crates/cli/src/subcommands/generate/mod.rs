@@ -340,6 +340,10 @@ fn deref_slice(mem: &[u8], offset: u32, len: u32) -> anyhow::Result<&[u8]> {
         .context("pointer out of bounds")
 }
 
+fn read_u32(mem: &[u8], offset: u32) -> anyhow::Result<u32> {
+    Ok(u32::from_le_bytes(deref_slice(mem, offset, 4)?.try_into().unwrap()))
+}
+
 impl WasmCtx {
     pub fn get_mem(&self) -> wasmtime::Memory {
         self.mem.expect("Initialized memory")
@@ -364,7 +368,7 @@ impl WasmCtx {
         let (mem, env) = Self::mem_env(&mut caller);
 
         // Read `buffer_len`, i.e., the capacity of `buffer` pointed to by `buffer_ptr`.
-        let buffer_len = u32::from_le_bytes(deref_slice(mem, buffer_len_ptr, 4)?.try_into().unwrap());
+        let buffer_len = read_u32(mem, buffer_len_ptr)?;
         // Write `buffer` to `sink`.
         let buffer = deref_slice(mem, buffer_ptr, buffer_len)?;
         env.sink.extend(buffer);
