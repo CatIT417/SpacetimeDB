@@ -1,11 +1,14 @@
 use crate::dml::MutationPlan;
-use crate::plan::{IxScan, Label, PhysicalExpr, PhysicalPlan, ProjectListPlan, ProjectPlan, Sarg, Semi, TupleField};
+use crate::plan::{
+    HashJoin, IxJoin, IxScan, Label, PhysicalExpr, PhysicalPlan, ProjectListPlan, ProjectPlan, Sarg, Semi, TableScan,
+    TupleField,
+};
 use crate::{PhysicalCtx, PlanCtx};
 use itertools::Itertools;
 use spacetimedb_expr::expr::AggType;
 use spacetimedb_expr::StatementSource;
 use spacetimedb_lib::AlgebraicValue;
-use spacetimedb_primitives::{ColId, ConstraintId, IndexId};
+use spacetimedb_primitives::{ColId, ColList, ConstraintId, IndexId};
 use spacetimedb_schema::def::ConstraintData;
 use spacetimedb_schema::schema::{IndexSchema, TableSchema};
 use spacetimedb_sql_parser::ast::BinOp;
@@ -177,13 +180,16 @@ impl<'a> PrintName<'a> {
 pub struct PrintIndex<'a> {
     name: PrintName<'a>,
     cols: Vec<Field<'a>>,
+    table: &'a str,
+    unique: bool,
 }
 
 impl<'a> PrintIndex<'a> {
     pub fn new(idx: &'a IndexSchema, table: &'a TableSchema) -> Self {
-        let cols = idx
-            .index_algorithm
-            .columns()
+        let cols = ColList::from_iter(idx.index_algorithm.columns().iter());
+        let unique = table.is_unique(&cols);
+
+        let cols = cols
             .iter()
             .map(|x| Field {
                 table: table.table_name.as_ref(),
@@ -194,6 +200,8 @@ impl<'a> PrintIndex<'a> {
         Self {
             name: PrintName::index(idx.index_id, &idx.index_name),
             cols,
+            table: &table.table_name,
+            unique,
         }
     }
 }
@@ -211,6 +219,7 @@ pub enum Line<'a> {
     },
     FilterIxScan {
         idx: &'a IxScan,
+        index: &'a IndexSchema,
         label: Label,
         ident: u16,
     },
@@ -257,6 +266,10 @@ pub enum Line<'a> {
         table_name: &'a str,
         ident: u16,
     },
+    Output {
+        columns: Output<'a>,
+        ident: u16,
+    },
 }
 
 impl Line<'_> {
@@ -275,6 +288,7 @@ impl Line<'_> {
             Line::Insert { ident, .. } => *ident,
             Line::Update { ident, .. } => *ident,
             Line::Delete { ident, .. } => *ident,
+            Line::Output { ident, .. } => *ident,
         };
         ident as usize
     }
@@ -288,9 +302,7 @@ pub struct Field<'a> {
 }
 
 /// The output of the plan, aka the projected columns
-enum Output<'a> {
-    Unknown,
-    Star(Vec<Field<'a>>),
+pub enum Output<'a> {
     Fields(Vec<Field<'a>>),
     Alias(&'a str),
     Empty,
@@ -334,7 +346,6 @@ impl<'a> Output<'a> {
 struct Lines<'a> {
     lines: Vec<Line<'a>>,
     labels: Labels<'a>,
-    output: Output<'a>,
     /// A map of label to table name or alias
     vars: HashMap<usize, &'a str>,
 }
@@ -344,7 +355,6 @@ impl<'a> Lines<'a> {
         Self {
             lines: Vec::new(),
             labels: Labels::new(),
-            output: Output::Unknown,
             vars,
         }
     }
@@ -360,20 +370,16 @@ impl<'a> Lines<'a> {
     }
 }
 
-fn eval_expr<'a>(lines: &mut Lines<'a>, expr: &'a PhysicalExpr, ident: u16) {
-    lines.add(Line::Filter { expr, ident });
-}
-
 /// Determine the output of a join using the direction of the [`Semi`] join
 fn output_join<'a>(lines: &Lines<'a>, semi: &'a Semi, label_lhs: Label, label_rhs: Label) -> Output<'a> {
     match semi {
         Semi::Lhs => {
             let schema = lines.labels.table_by_label(&label_lhs).unwrap();
-            Output::Star(Output::fields(schema))
+            Output::Fields(Output::fields(schema))
         }
         Semi::Rhs => {
             let schema = lines.labels.table_by_label(&label_rhs).unwrap();
-            Output::Star(Output::fields(schema))
+            Output::Fields(Output::fields(schema))
         }
         Semi::All => {
             let schema = lines.labels.table_by_label(&label_lhs).unwrap();
@@ -381,7 +387,63 @@ fn output_join<'a>(lines: &Lines<'a>, semi: &'a Semi, label_lhs: Label, label_rh
             let schema = lines.labels.table_by_label(&label_rhs).unwrap();
             let rhs = Output::fields(schema);
 
-            Output::Star(lhs.iter().chain(rhs.iter()).cloned().collect())
+            Output::Fields(lhs.iter().chain(rhs.iter()).cloned().collect())
+        }
+    }
+}
+
+fn output_cross<'a>(lhs: &'a Schema, rhs: &'a Schema) -> Output<'a> {
+    let lhs = Output::fields(lhs);
+    let rhs = Output::fields(rhs);
+
+    Output::Fields(lhs.iter().chain(rhs.iter()).cloned().collect())
+}
+
+enum PrinterPlan<'a> {
+    /// Scan a table row by row, returning row ids
+    TableScan(&'a TableScan, Label, &'a Schema<'a>),
+    /// Fetch row ids from an index
+    IxScan(&'a IxScan, Label, &'a IndexSchema, &'a Schema<'a>),
+    /// An index join + projection
+    IxJoin(&'a IxJoin, Semi),
+    /// A hash join + projection
+    HashJoin(&'a HashJoin, Semi),
+    /// A nested loop join
+    NLJoin(Box<PrinterPlan<'a>>, Box<PrinterPlan<'a>>),
+    /// A tuple-at-a-time filter
+    Filter(Box<PrinterPlan<'a>>, PhysicalExpr),
+}
+
+/// Scan the tables and add them to the labels
+fn scan_tables<'a>(lines: &'a mut Lines<'a>, plan: &'a PhysicalPlan) -> PrinterPlan<'a> {
+    match plan {
+        PhysicalPlan::TableScan(scan, label) => {
+            lines.add_table(*label, &scan.schema);
+            let schema = lines.labels.table_by_label(label).unwrap();
+
+            PrinterPlan::TableScan(scan, *label, schema)
+        }
+        PhysicalPlan::IxScan(idx, label) => {
+            lines.add_table(*label, &idx.schema);
+            let schema = lines.labels.table_by_label(label).unwrap();
+
+            let index = idx.schema.indexes.iter().find(|x| x.index_id == idx.index_id).unwrap();
+
+            PrinterPlan::IxScan(idx, *label, index, schema)
+        }
+        PhysicalPlan::IxJoin(idx, semi) => {
+            lines.add_table(idx.rhs_label, &idx.rhs);
+            PrinterPlan::IxJoin(idx, *semi)
+        }
+        PhysicalPlan::HashJoin(idx, semi) => PrinterPlan::HashJoin(idx, *semi),
+        PhysicalPlan::NLJoin(lhs, rhs) => {
+            let lhs = scan_tables(lines, lhs);
+            let rhs = scan_tables(lines, rhs);
+            PrinterPlan::NLJoin(Box::new(lhs), Box::new(rhs))
+        }
+        PhysicalPlan::Filter(plan, expr) => {
+            let plan = Box::new(scan_tables(lines, plan));
+            PrinterPlan::Filter(plan, expr.clone())
         }
     }
 }
@@ -391,10 +453,6 @@ fn eval_plan<'a>(lines: &mut Lines<'a>, plan: &'a PhysicalPlan, ident: u16) {
         PhysicalPlan::TableScan(scan, label) => {
             lines.add_table(*label, &scan.schema);
 
-            let schema = lines.labels.table_by_label(label).unwrap();
-            let table = schema.name;
-            lines.output = Output::Star(Output::fields(schema));
-
             let ident = if let Some(limit) = scan.limit {
                 lines.add(Line::Limit { limit, ident });
                 ident + 2
@@ -402,18 +460,23 @@ fn eval_plan<'a>(lines: &mut Lines<'a>, plan: &'a PhysicalPlan, ident: u16) {
                 ident
             };
 
+            let schema = lines.labels.table_by_label(label).unwrap();
+            let table = schema.name;
+            let columns = Output::Fields(Output::fields(schema));
+
             lines.add(Line::TableScan {
                 table,
                 label: label.0,
                 ident,
             });
+
+            lines.add(Line::Output {
+                columns,
+                ident: ident + 2,
+            });
         }
         PhysicalPlan::IxScan(idx, label) => {
             lines.add_table(*label, &idx.schema);
-            let schema = lines.labels.table_by_label(label).unwrap();
-            lines.output = Output::Star(Output::fields(schema));
-
-            let index = idx.schema.indexes.iter().find(|x| x.index_id == idx.index_id).unwrap();
 
             let ident = if let Some(limit) = idx.limit {
                 lines.add(Line::Limit { limit, ident });
@@ -422,31 +485,45 @@ fn eval_plan<'a>(lines: &mut Lines<'a>, plan: &'a PhysicalPlan, ident: u16) {
                 ident
             };
 
+            let schema = lines.labels.table_by_label(label).unwrap();
+            let columns = Output::Fields(Output::fields(schema));
+            let index = idx.schema.indexes.iter().find(|x| x.index_id == idx.index_id).unwrap();
+
             lines.add(Line::IxScan {
                 table_name: &idx.schema.table_name,
                 index: PrintName::index(idx.index_id, &index.index_name),
                 ident,
             });
 
+            lines.add(Line::Output {
+                columns,
+                ident: ident + 2,
+            });
+
             lines.add(Line::FilterIxScan {
                 idx,
+                index,
                 label: *label,
-                ident: ident + 4,
+                ident: ident + 2,
             });
         }
         PhysicalPlan::IxJoin(idx, semi) => {
             lines.add_table(idx.rhs_label, &idx.rhs);
-            //let lhs = lines.labels.table_by_label(&idx.lhs_field.label).unwrap();
             let rhs = lines.labels.table_by_label(&idx.rhs_label).unwrap();
+            let rhs_name = rhs.name.to_string();
+
             lines.add(Line::IxJoin {
                 semi,
                 ident,
-                rhs: rhs.name.to_string(),
+                rhs: rhs_name,
+            });
+
+            lines.add(Line::Output {
+                columns: output_join(lines, semi, idx.lhs_field.label, idx.rhs_label),
+                ident,
             });
 
             eval_plan(lines, &idx.lhs, ident + 2);
-
-            lines.output = output_join(lines, semi, idx.lhs_field.label, idx.rhs_label);
 
             let lhs = lines.labels.field(&idx.lhs_field).unwrap();
             let rhs = lines.labels.label(&idx.rhs_label, idx.rhs_field).unwrap();
@@ -464,7 +541,10 @@ fn eval_plan<'a>(lines: &mut Lines<'a>, plan: &'a PhysicalPlan, ident: u16) {
             eval_plan(lines, &idx.lhs, ident + 2);
             eval_plan(lines, &idx.rhs, ident + 2);
 
-            lines.output = output_join(lines, semi, idx.lhs_field.label, idx.rhs_field.label);
+            lines.add(Line::Output {
+                columns: output_join(lines, semi, idx.lhs_field.label, idx.rhs_field.label),
+                ident: ident + 2,
+            });
 
             let lhs = lines.labels.field(&idx.lhs_field).unwrap();
             let rhs = lines.labels.field(&idx.rhs_field).unwrap();
@@ -478,13 +558,14 @@ fn eval_plan<'a>(lines: &mut Lines<'a>, plan: &'a PhysicalPlan, ident: u16) {
         }
         PhysicalPlan::NLJoin(lhs, rhs) => {
             lines.add(Line::NlJoin { ident });
-
+            dbg!(lhs.labels());
+            dbg!(rhs.labels());
             eval_plan(lines, lhs, ident + 2);
             eval_plan(lines, rhs, ident + 2);
         }
-        PhysicalPlan::Filter(plan, filter) => {
+        PhysicalPlan::Filter(plan, expr) => {
             eval_plan(lines, plan, ident);
-            eval_expr(lines, filter, ident + 2);
+            lines.add(Line::Filter { expr, ident: ident + 2 });
         }
     }
 }
@@ -519,8 +600,11 @@ fn eval_dml_plan<'a>(lines: &mut Lines<'a>, plan: &'a MutationPlan, ident: u16) 
             });
             eval_plan(lines, &plan.filter, ident + 2);
         }
-    }
-    lines.output = Output::Empty;
+    };
+    lines.add(Line::Output {
+        columns: Output::Empty,
+        ident: ident + 2,
+    });
 }
 /// A pretty printer for physical plans
 ///
@@ -535,7 +619,6 @@ pub struct Explain<'a> {
     ctx: &'a PhysicalCtx<'a>,
     lines: Vec<Line<'a>>,
     labels: Labels<'a>,
-    output: Output<'a>,
     options: ExplainOptions,
 }
 
@@ -545,7 +628,6 @@ impl<'a> Explain<'a> {
             ctx,
             lines: Vec::new(),
             labels: Labels::new(),
-            output: Output::Unknown,
             options: ExplainOptions::new(),
         }
     }
@@ -565,14 +647,15 @@ impl<'a> Explain<'a> {
                 ProjectListPlan::Name(ProjectPlan::None(plan)) => {
                     eval_plan(&mut lines, plan, 0);
                 }
-                ProjectListPlan::Name(ProjectPlan::Name(plan, label, _count)) => {
+                ProjectListPlan::Name(ProjectPlan::Name(plan, _label, _count)) => {
                     eval_plan(&mut lines, plan, 0);
-                    let schema = lines.labels.table_by_label(label).unwrap();
-                    lines.output = Output::Star(Output::fields(schema));
                 }
                 ProjectListPlan::List(plan, fields) => {
                     eval_plan(&mut lines, plan, 0);
-                    lines.output = Output::Fields(Output::tuples(fields, &lines));
+                    lines.add(Line::Output {
+                        columns: Output::Fields(Output::tuples(fields, &lines)),
+                        ident: 2,
+                    });
                 }
                 ProjectListPlan::Limit(plan, limit) => {
                     lines.add(Line::Limit {
@@ -585,7 +668,10 @@ impl<'a> Explain<'a> {
                     match agg {
                         AggType::Count { alias } => {
                             lines.add(Line::Count { ident: 0 });
-                            lines.output = Output::Alias(alias)
+                            lines.add(Line::Output {
+                                columns: Output::Alias(alias),
+                                ident: 2,
+                            });
                         }
                     }
                     eval_plan(&mut lines, plan, 2);
@@ -605,7 +691,6 @@ impl<'a> Explain<'a> {
         Self {
             lines: lines.lines,
             labels: lines.labels,
-            output: lines.output,
             ..self
         }
     }
@@ -690,8 +775,14 @@ impl fmt::Display for PrintName<'_> {
 
 impl fmt::Display for PrintIndex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: ", self.name)?;
-        write!(f, "({})", self.cols.iter().join(", "))
+        write!(
+            f,
+            "{}: ({}) (table: {}, unique: {})",
+            self.name,
+            self.cols.iter().join(", "),
+            self.table,
+            self.unique
+        )
     }
 }
 
@@ -708,8 +799,9 @@ impl fmt::Display for Explain<'_> {
             writeln!(f)?;
         }
 
-        for line in &self.lines {
+        for (pos, line) in self.lines.iter().enumerate() {
             let ident = line.ident();
+            let ident = if ident > 2 { ident + 1 } else { ident };
             let arrow = if ident > 0 { "-> " } else { "" };
 
             match line {
@@ -728,7 +820,7 @@ impl fmt::Display for Explain<'_> {
                     write!(f, "{:ident$}{arrow}Index Scan using {index} on {table_name}", "")?;
                 }
                 Line::Filter { expr, ident: _ } => {
-                    write!(f, "{:ident$}Filter: ", "")?;
+                    write!(f, "{:ident$}{arrow}Filter: ", "")?;
                     write!(
                         f,
                         "({})",
@@ -738,7 +830,14 @@ impl fmt::Display for Explain<'_> {
                         }
                     )?;
                 }
-                Line::FilterIxScan { idx, label, ident: _ } => {
+                Line::FilterIxScan {
+                    idx,
+                    index,
+                    label,
+                    ident: _,
+                } => {
+                    let index = PrintIndex::new(index, &idx.schema);
+                    writeln!(f, "{:ident$}{index}", "")?;
                     write!(f, "{:ident$}Index Cond: ", "")?;
                     write!(
                         f,
@@ -798,32 +897,20 @@ impl fmt::Display for Explain<'_> {
                 Line::Delete { table_name, ident: _ } => {
                     write!(f, "{:ident$}{arrow}Delete on {table_name}", "")?;
                 }
-            }
-            writeln!(f)?;
-        }
+                Line::Output { columns, ident: _ } => {
+                    let columns = match columns {
+                        Output::Fields(fields) => fields.iter().map(|x| format!("{}", x)).join(", "),
+                        Output::Alias(alias) => alias.to_string(),
+                        Output::Empty => "void".to_string(),
+                    };
 
-        let columns = match &self.output {
-            Output::Unknown => None,
-            Output::Star(fields) => {
-                let columns = fields.iter().map(|x| format!("{}", x)).join(", ");
-                Some(columns)
+                    write!(f, "{:ident$}Output: {columns}", "")?;
+                }
             }
-            Output::Fields(fields) => {
-                let columns = fields.iter().map(|x| format!("{}", x)).join(", ");
-                Some(columns)
+
+            if self.options.show_timings || self.options.show_schema || pos < self.lines.len() - 1 {
+                writeln!(f)?;
             }
-            Output::Alias(alias) => Some(alias.to_string()),
-            Output::Empty => Some("void".to_string()),
-        };
-        let end = if self.options.show_timings || self.options.show_schema {
-            "\n"
-        } else {
-            ""
-        };
-        if let Some(columns) = columns {
-            write!(f, "  Output: {columns}{end}")?;
-        } else {
-            write!(f, "  Output: ?{end}")?;
         }
 
         if self.options.show_timings {
