@@ -4,7 +4,10 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+pub mod b_tree_u_32_type;
+pub mod btree_u_32_table;
 pub mod byte_struct_type;
+pub mod delete_from_btree_u_32_reducer;
 pub mod delete_large_table_reducer;
 pub mod delete_pk_bool_reducer;
 pub mod delete_pk_connection_id_reducer;
@@ -56,6 +59,7 @@ pub mod insert_caller_unique_connection_id_reducer;
 pub mod insert_caller_unique_identity_reducer;
 pub mod insert_caller_vec_connection_id_reducer;
 pub mod insert_caller_vec_identity_reducer;
+pub mod insert_into_btree_u_32_reducer;
 pub mod insert_large_table_reducer;
 pub mod insert_one_bool_reducer;
 pub mod insert_one_byte_struct_reducer;
@@ -371,7 +375,12 @@ pub mod vec_u_8_type;
 pub mod vec_unit_struct_table;
 pub mod vec_unit_struct_type;
 
+pub use b_tree_u_32_type::BTreeU32;
+pub use btree_u_32_table::*;
 pub use byte_struct_type::ByteStruct;
+pub use delete_from_btree_u_32_reducer::{
+    delete_from_btree_u_32, set_flags_for_delete_from_btree_u_32, DeleteFromBtreeU32CallbackId,
+};
 pub use delete_large_table_reducer::{
     delete_large_table, set_flags_for_delete_large_table, DeleteLargeTableCallbackId,
 };
@@ -468,6 +477,9 @@ pub use insert_caller_vec_connection_id_reducer::{
 };
 pub use insert_caller_vec_identity_reducer::{
     insert_caller_vec_identity, set_flags_for_insert_caller_vec_identity, InsertCallerVecIdentityCallbackId,
+};
+pub use insert_into_btree_u_32_reducer::{
+    insert_into_btree_u_32, set_flags_for_insert_into_btree_u_32, InsertIntoBtreeU32CallbackId,
 };
 pub use insert_large_table_reducer::{
     insert_large_table, set_flags_for_insert_large_table, InsertLargeTableCallbackId,
@@ -892,6 +904,9 @@ pub use vec_unit_struct_type::VecUnitStruct;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
+    DeleteFromBtreeU32 {
+        rows: Vec<BTreeU32>,
+    },
     DeleteLargeTable {
         a: u8,
         b: u16,
@@ -1036,6 +1051,9 @@ pub enum Reducer {
     },
     InsertCallerVecConnectionId,
     InsertCallerVecIdentity,
+    InsertIntoBtreeU32 {
+        rows: Vec<BTreeU32>,
+    },
     InsertLargeTable {
         a: u8,
         b: u16,
@@ -1517,6 +1535,7 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
+            Reducer::DeleteFromBtreeU32 { .. } => "delete_from_btree_u32",
             Reducer::DeleteLargeTable { .. } => "delete_large_table",
             Reducer::DeletePkBool { .. } => "delete_pk_bool",
             Reducer::DeletePkConnectionId { .. } => "delete_pk_connection_id",
@@ -1561,6 +1580,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::InsertCallerUniqueIdentity { .. } => "insert_caller_unique_identity",
             Reducer::InsertCallerVecConnectionId => "insert_caller_vec_connection_id",
             Reducer::InsertCallerVecIdentity => "insert_caller_vec_identity",
+            Reducer::InsertIntoBtreeU32 { .. } => "insert_into_btree_u32",
             Reducer::InsertLargeTable { .. } => "insert_large_table",
             Reducer::InsertOneBool { .. } => "insert_one_bool",
             Reducer::InsertOneByteStruct { .. } => "insert_one_byte_struct",
@@ -1696,6 +1716,10 @@ impl TryFrom<__ws::ReducerCallInfo<__ws::BsatnFormat>> for Reducer {
     type Error = __sdk::Error;
     fn try_from(value: __ws::ReducerCallInfo<__ws::BsatnFormat>) -> __sdk::Result<Self> {
         match &value.reducer_name[..] {
+            "delete_from_btree_u32" => Ok(__sdk::parse_reducer_args::<
+                delete_from_btree_u_32_reducer::DeleteFromBtreeU32Args,
+            >("delete_from_btree_u32", &value.args)?
+            .into()),
             "delete_large_table" => Ok(
                 __sdk::parse_reducer_args::<delete_large_table_reducer::DeleteLargeTableArgs>(
                     "delete_large_table",
@@ -1937,6 +1961,10 @@ impl TryFrom<__ws::ReducerCallInfo<__ws::BsatnFormat>> for Reducer {
             "insert_caller_vec_identity" => Ok(__sdk::parse_reducer_args::<
                 insert_caller_vec_identity_reducer::InsertCallerVecIdentityArgs,
             >("insert_caller_vec_identity", &value.args)?
+            .into()),
+            "insert_into_btree_u32" => Ok(__sdk::parse_reducer_args::<
+                insert_into_btree_u_32_reducer::InsertIntoBtreeU32Args,
+            >("insert_into_btree_u32", &value.args)?
             .into()),
             "insert_large_table" => Ok(
                 __sdk::parse_reducer_args::<insert_large_table_reducer::InsertLargeTableArgs>(
@@ -2648,6 +2676,7 @@ impl TryFrom<__ws::ReducerCallInfo<__ws::BsatnFormat>> for Reducer {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct DbUpdate {
+    btree_u_32: __sdk::TableUpdate<BTreeU32>,
     indexed_table: __sdk::TableUpdate<IndexedTable>,
     indexed_table_2: __sdk::TableUpdate<IndexedTable2>,
     large_table: __sdk::TableUpdate<LargeTable>,
@@ -2750,6 +2779,7 @@ impl TryFrom<__ws::DatabaseUpdate<__ws::BsatnFormat>> for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_update in raw.tables {
             match &table_update.table_name[..] {
+                "btree_u32" => db_update.btree_u_32 = btree_u_32_table::parse_table_update(table_update)?,
                 "indexed_table" => db_update.indexed_table = indexed_table_table::parse_table_update(table_update)?,
                 "indexed_table_2" => {
                     db_update.indexed_table_2 = indexed_table_2_table::parse_table_update(table_update)?
@@ -2913,6 +2943,7 @@ impl __sdk::DbUpdate for DbUpdate {
     fn apply_to_client_cache(&self, cache: &mut __sdk::ClientCache<RemoteModule>) -> AppliedDiff<'_> {
         let mut diff = AppliedDiff::default();
 
+        diff.btree_u_32 = cache.apply_diff_to_table::<BTreeU32>("btree_u32", &self.btree_u_32);
         diff.indexed_table = cache.apply_diff_to_table::<IndexedTable>("indexed_table", &self.indexed_table);
         diff.indexed_table_2 = cache.apply_diff_to_table::<IndexedTable2>("indexed_table_2", &self.indexed_table_2);
         diff.large_table = cache.apply_diff_to_table::<LargeTable>("large_table", &self.large_table);
@@ -3071,6 +3102,7 @@ impl __sdk::DbUpdate for DbUpdate {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct AppliedDiff<'r> {
+    btree_u_32: __sdk::TableAppliedDiff<'r, BTreeU32>,
     indexed_table: __sdk::TableAppliedDiff<'r, IndexedTable>,
     indexed_table_2: __sdk::TableAppliedDiff<'r, IndexedTable2>,
     large_table: __sdk::TableAppliedDiff<'r, LargeTable>,
@@ -3173,6 +3205,7 @@ impl __sdk::InModule for AppliedDiff<'_> {
 
 impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     fn invoke_row_callbacks(&self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {
+        callbacks.invoke_table_row_callbacks::<BTreeU32>("btree_u32", &self.btree_u_32, event);
         callbacks.invoke_table_row_callbacks::<IndexedTable>("indexed_table", &self.indexed_table, event);
         callbacks.invoke_table_row_callbacks::<IndexedTable2>("indexed_table_2", &self.indexed_table_2, event);
         callbacks.invoke_table_row_callbacks::<LargeTable>("large_table", &self.large_table, event);
@@ -3878,6 +3911,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
     type SubscriptionHandle = SubscriptionHandle;
 
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
+        btree_u_32_table::register_table(client_cache);
         indexed_table_table::register_table(client_cache);
         indexed_table_2_table::register_table(client_cache);
         large_table_table::register_table(client_cache);

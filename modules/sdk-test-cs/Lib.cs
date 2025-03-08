@@ -1739,6 +1739,24 @@ public static partial class Module
         ctx.Db.pk_connection_id.Insert(new PkConnectionId { a = (ConnectionId)ctx.ConnectionId!, data = data });
     }
 
+    [SpacetimeDB.Reducer]
+    public static void insert_into_btree_u32(ReducerContext ctx, List<BTreeU32> rows)
+    {
+        foreach (var row in rows)
+        {
+            ctx.Db.btree_u32.Insert(row);
+        }
+    }
+
+    [SpacetimeDB.Reducer]
+    public static void delete_from_btree_u32(ReducerContext ctx, List<BTreeU32> rows)
+    {
+        foreach (var row in rows)
+        {
+            ctx.Db.btree_u32.Delete(row);
+        }
+    }
+
     [SpacetimeDB.Table(Name = "large_table", Public = true)]
     public partial struct LargeTable
     {
@@ -1953,5 +1971,13 @@ public static partial class Module
     {
         uint player_id;
         float player_snazz;
+    }
+
+    [SpacetimeDB.Table(Name = "btree_u32", Public = true)]
+    public partial struct BTreeU32
+    {
+        [SpacetimeDB.Index.BTree]
+        uint n;
+        int data;
     }
 }

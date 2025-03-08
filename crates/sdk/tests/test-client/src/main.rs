@@ -121,6 +121,7 @@ fn main() {
         "row-deduplication" => exec_row_deduplication(),
         "row-deduplication-join-r-and-s" => exec_row_deduplication_join_r_and_s(),
         "row-deduplication-r-join-s-and-r-joint" => exec_row_deduplication_r_join_s_and_r_join_t(),
+        "test-intra-query-bag-semantics-for-join" => test_intra_query_bag_semantics_for_join(),
         _ => panic!("Unknown test: {}", test),
     }
 }
@@ -2083,4 +2084,55 @@ fn exec_row_deduplication_r_join_s_and_r_join_t() {
     test_counter.wait_for_all();
 
     assert_eq!(count_unique_u32_on_insert.load(Ordering::SeqCst), 1);
+}
+
+/// Test that when subscribing to a single join query,
+/// the server returns a bag of rows to the client - not a set.
+///
+/// This is a regression test for [2397](https://github.com/clockworklabs/SpacetimeDB/issues/2397),
+/// where the server was incorrectly deduplicating incremental subscription updates.
+fn test_intra_query_bag_semantics_for_join() {
+    let test_counter = TestCounter::new();
+    let sub_applied_nothing_result = test_counter.add_test("on_subscription_applied_nothing");
+
+    connect_then(&test_counter, {
+        move |ctx| {
+            subscribe_these_then(
+                ctx,
+                &["SELECT pk_u32.* FROM pk_u32 JOIN btree_u32 ON pk_u32.n = btree_u32.n"],
+                move |ctx| {
+                    // Insert the row (n: 0, data: 1) into pk_u32.
+                    // At this point btree_u32 is empty,
+                    // so no subscription update will be sent,
+                    // and no callbacks invoked.
+                    PkU32::insert(ctx, 0, 1);
+
+                    // Now we insert two tuples into btree_u32.
+                    // Both of them join with the row in pk_u32.
+                    // Hence an update will be sent from the server,
+                    // and on_insert invoked for (n: 0, data: 1).
+                    // Note, the multiplicity of this row is 2.
+                    ctx.reducers
+                        .insert_into_btree_u_32(vec![BTreeU32 { n: 0, data: 0 }, BTreeU32 { n: 0, data: 1 }])
+                        .unwrap();
+
+                    // Now we delete one of the rows in btree_u32.
+                    // If we have implemented bag semantics correctly,
+                    // we will not invoke pk_u32::on_delete,
+                    // because (n: 0, data: 1) still has a multiplicity of 1.
+                    ctx.reducers
+                        .delete_from_btree_u_32(vec![BTreeU32 { n: 0, data: 0 }])
+                        .unwrap();
+
+                    sub_applied_nothing_result(assert_all_tables_empty(ctx));
+                },
+            );
+
+            PkU32::on_delete(ctx, |_, _| {
+                panic!("Bag semantics not implemented correctly; we never delete a `PkU32`")
+            });
+        }
+    });
+
+    test_counter.wait_for_all();
 }
